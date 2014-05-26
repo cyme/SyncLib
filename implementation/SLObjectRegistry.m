@@ -567,24 +567,23 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 }
 
 
-- (void)markObjectModified:(SLObject *)object remotely:(BOOL)remotely
+- (void)markObjectModified:(SLObject *)object local:(BOOL)local
 {
-    if (remotely)
-        [self.remotelyModifiedObjects addObject:object];
-    else {
+    if (local) {
         [self.locallyModifiedObjects addObject:object];
         [self.locallyModifiedObjectIDMap setObject:object forKey:object.objectID];
-    }
+
+    } else
+        [self.remotelyModifiedObjects addObject:object];
 }
 
-- (void)markObjectUnmodified:(SLObject *)object remotely:(BOOL)remotely
+- (void)markObjectUnmodified:(SLObject *)object local:(BOOL)local
 {
-    if (remotely)
-        [self.remotelyModifiedObjects removeObject:object];
-    else {
+    if (local) {
         [self.locallyModifiedObjects removeObject:object];
         [self.locallyModifiedObjectIDMap removeObjectForKey:object.objectID];
-    }
+    } else
+        [self.remotelyModifiedObjects removeObject:object];
 }
 
 - (NSArray *)classNames

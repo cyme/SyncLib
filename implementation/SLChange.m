@@ -112,7 +112,7 @@ NSString *kSLChangeNValueName = @"SLCNValue";
     
     // remember the object was modified
     
-    [registry markObjectModified:object remotely:local];
+    [registry markObjectModified:object local:local];
     
     return change;
 }
@@ -136,7 +136,7 @@ NSString *kSLChangeNValueName = @"SLCNValue";
     // drop the object from the modified list if no more change left for this object
     
     if ([changes count] == 0)
-        [object.registry markObjectUnmodified:object remotely:self.local];
+        [object.registry markObjectUnmodified:object local:self.local];
 }
 
 

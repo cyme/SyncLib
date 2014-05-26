@@ -35,8 +35,8 @@
 - (void)addObject:(SLObject *)object;
 - (void)removeObject:(SLObject *)object;
 - (void)removeAllObjects;
-- (void)markObjectModified:(SLObject *)object remotely:(BOOL)remotely;
-- (void)markObjectUnmodified:(SLObject *)object remotely:(BOOL)remotely;
+- (void)markObjectModified:(SLObject *)object local:(BOOL)local;
+- (void)markObjectUnmodified:(SLObject *)object local:(BOOL)local;
 
 - (NSArray *)classNames;
 - (SLObject *)objectForID:(NSString *)objectID;
