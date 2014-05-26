@@ -861,7 +861,7 @@ static void objectSetterGlueWithoutChange(id self, SEL _cmd, id value)
 
 static void charSetterGlueWithoutChange(id self, SEL _cmd, char value)
 {
-    objectSetterGlueWithChange(self, _cmd, [NSNumber numberWithChar:value]);
+    objectSetterGlueWithoutChange(self, _cmd, [NSNumber numberWithChar:value]);
 }
 
 static void shortSetterGlueWithoutChange(id self, SEL _cmd, short value)
