@@ -7,7 +7,9 @@
 //
 
 #import "SLOperationManager.h"
-#import "SLObject.h"
+#import "SLObject-Internal.h"
+#import "BlockCondition.h"
+#import <Parse/Parse.h>
 
 #define USE_REACHABILITY_LIBRARY    0
 
@@ -94,7 +96,10 @@ static void reachabilityChanged(SCNetworkReachabilityRef target, SCNetworkReacha
 #endif
 
 
-- (id) init {
+- (id)init
+{
+    self = [super init];
+    assert(self);
     
     _online = [BlockCondition blockCondition];
     assert(_online);

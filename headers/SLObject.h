@@ -5,10 +5,9 @@
 //
 
 // TO DO
-// - support for timing settings (sync heartbeat interval & sync lag after change)
-// - support for carrying over unsaved PFObject creation/changes/deletion from one app session to the next
+// - support for timing settings (sync heartbeat interval)
+// - support for carrying over unsaved PFObject creation/changes/deletion from one app session to the next (journaling)
 // - transactions
-//          - (void)transactionWithBlock:((NSError *)(^)())block;
 // - support for collection properties
 // - support for queries
 // - support for large data set
@@ -48,6 +47,7 @@
 // - SLObject is an abstract class and must be subclassed to implement a database table
 // - subclasses must be registered with the framework
 // - subclass attributes may choose between 3 storage classes: 1) cloud persisted (& synchronized), 2) locally persisted only (in device cache), 3) transient (memory only)
+// - sublclass attribute may be objects or scalar types. collections are not supported.
 // memory management:
 // - objects are instantiated either explicitely (local object creation) or implicitely (read from the device cache, remote object creation)
 // - database objects are instantiated only once ("uniquing")
@@ -116,72 +116,10 @@
 
 #import <Foundation/Foundation.h>
 
-@class PFObject;
 @protocol SLObjectObserving;
 
 
 @interface SLObject : NSObject <NSCoding>
-
-// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-// Class methods that operate on the entire collection of SLObjects and its subclasses
-// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-
-#pragma mark - Methods operating on entire collection
-
-// call + registerSyncClient:appID:syncInterval: in the -application:didRegisterForRemoteNotificationsWithDeviceToken: method of
-// your app delegate class to register your client. The client isn't fully registered and ready to use until +enablePush: has been called
-
-+ (void) registerSyncClient: (NSString *)clientKey appID: (NSString *)appID;
-
-// call +enablePush: in the -application:didRegisterForRemoteNotificationsWithDeviceToken: method of your app delegate class to enable
-// push and complete the client registration. SyncLib is ready for use after this call.
-
-+ (void) enablePush: (NSData *)deviceToken;
-
-// call +handlePushNotification: in the -application:didReceiveRemoteNotification: method of your app delegate
-// call to handle push notifications
-
-+ (void) handlePushNotification: (NSDictionary *)userInfo;
-
-// call +saveToDisk in the applicationDidEnterBackground: and applicationWillTerminate: methods of your app delegate class
-// to save the local database cache and locally persisted objects & properties to "disk"
-
-+ (void) saveToDisk;
-
-// call +syncAllInBackgroundWithBlock: if you want to force a sync to the cloud database.
-// clients are otherwise automatically synced:
-// 1) at regular intervals as specified by registerSyncClient:appID:syncInterval:
-// and 2) when you make changes to the database (with a delay)
-
-+ (void) syncAllInBackgroundWithBlock:(void (^) (NSError *))completion;
-
-// call +requestSyncingInBackgroundWithBlock: to request to join a syncing group. The call returns an invitation code that another client can use to approve the
-// request. The block is called upon approval and completion of the request or on error. The invitation code is valid for 5 minutes or until
-// + cancelSyncingRequest is called. A timeout error is returned in either case. An error is also returned if the operation cannot complete
-// due to lack or loss of connectivity. The call throws an exception if the calling client is already in syncing mode or in a transitional state, e.g.
-// there is a pending call to + requestSyncingInBackgroundWithBlock:. Upon completion of the association, all preexisting objects on the calling client are
-// preserved and added to the shared dataset.
-
-+ (NSInteger) requestSyncingInBackgroundWithBlock:(void (^) (NSError *))completion;
-
-
-+ (void) cancelSyncingRequest;
-
-// call +acceptSyncingRequestInBackgroundWithCode:block: with an invitation code to approve the requesting client to join the syncing group. If the calling client
-// isn't part of a syncing group, a new syncing group is formed. The block is called on completion of the association or on error. An error is returned if the
-// operation cannot complete due to lack or loss of connectivity.
-
-+ (void) acceptSyncingRequestInBackgroundWithCode: (NSInteger)associationCode block:(void (^) (NSError *))completion;
-
-// call +stopSyncingInBackground  the calling client from a syncing group. the call throws an exception is the client is not in syncing mode or in a transitional state.
-// Upon completion of the disassociation, the client is left with an empty dataset. Note that the call is asynchronous and the calling client
-// may still receive remote change notifications after the call has returned, e.g. if the call took place while a sync is in progress.
-
-+ (void) stopSyncingInBackgroundWithBlock:(void (^) (NSError *))completion;
-
-// +isSyncing returns whether the calling client is associated with a syncing group
-
-+ (BOOL) isSyncing;
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // Class methods for subclasses to override
@@ -191,7 +129,7 @@
 
 // all subclasses must implement this method to provide the subclass name
 
-+ (NSString *) className;
++ (NSString *)className;
 
 // by default, subclass properties are stored on the cloud and synced across all app installs of the syncing group.
 // app installs that are not part of a syncing group 
@@ -200,8 +138,8 @@
 // localPersistedProperties: should return an array of local property names that are persisted locally only
 // localTransientProperties: should return an array of local property names that are not persisted at all
 
-+ (NSArray *) localPersistedProperties;
-+ (NSArray *) localTransientProperties;
++ (NSArray *)localPersistedProperties;
++ (NSArray *)localTransientProperties;
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // Class methods that pertain to specific SLObject subclasses
@@ -213,20 +151,20 @@
 // It can safely be called multiple times on the same subclass.
 // This method will fail if used on SLObject rather than a subclass.
 
-+ (void) registerSubclass;
++ (void)registerSubclass;
 
 // Create a new object of this subclass and add it to the database. Object property values (of all storage classes)
 // can be specified in the dictionary.  The object instance is returned. This method will fail if used on SLObject
 // rather than a subclass
 
-+ (id) objectWithValues:(NSDictionary *)values;
++ (id)objectWithValues:(NSDictionary *)values;
 
 // Call this method to set add or remove a class observer. Observers will be notified in the order they have registered
 // to listen to the subclass
 // addObserver: will retroactively notify the observer of any past object creations (fetched from device cache and locally/remotely created)
 
-+ (void) addObserver:(id<SLObjectObserving>)observer;
-+ (void) removeObserver:(id<SLObjectObserving>)observer;
++ (void)addObserver:(id<SLObjectObserving>)observer;
++ (void)removeObserver:(id<SLObjectObserving>)observer;
 
 // ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // Instance methods that pertain to an instance of SLObject or a subclass
@@ -237,7 +175,7 @@
 // Delete object from database, detach it from the global object registery and mark the object instance
 // for deletion.
 
-- (void) delete;
+- (void)delete;
 
 @end
 

@@ -6,10 +6,12 @@
 //  Copyright (c) 2014 Cyril Meurillon. All rights reserved.
 //
 
-#import "SLClientManager.h"
+#import "SLClientManager-Internal.h"
 #import "SLObjectRegistry.h"
-#import "SLObject.h"
+#import "SLObject-Internal.h"
 #import "SLOperationManager.h"
+#import "BlockCondition.h"
+#import <Parse/Parse.h>
 
 
 #define KSLINVITATIONCODEDIGITS     (5)
@@ -19,6 +21,9 @@ NSInteger const SLInvitationCodeDigits = KSLINVITATIONCODEDIGITS;
 NSTimeInterval const SLInvitationTimeout = (100*60);
 NSString * const SLErrorDomain = @"com.cymelabs.synclib.ErrorDomain";
 
+static NSString * const kSLClientManagerSyncingKey = @"SLCMSyncing";
+static NSString * const kSLClientManagerSyncingGroupNameKey = @"SLCMSyncingGroupName";
+static NSString * const kSLClientManagerParseUserRegisteredKey = @"SLCLParseUserRegistered";
 
 static NSString * const kSLInvitationClassName = @"invitation";
 static NSString * const kSLInvitationCodeKey = @"code";
@@ -87,28 +92,74 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
 
 #pragma mark - Public Methods
 
-// return the shared instance of the client manager singleton
+// registerSyncClient:appID:syncInterval: real implementation is in SLObjectRegistry
 
-+ (SLClientManager *)sharedClientManager
++ (void)registerSyncClient:(NSString *)clientKey appID:(NSString *)appID
 {
-    static SLClientManager *clientMgr = nil;
-    static dispatch_once_t  onceToken;
-    
-    // check if the registry needs to be initialized
-    
-    if (!clientMgr)
-        
-        // initialize the registry in a thread-safe manner
-        // this really isn't necessary given that the library currently isn't thread safe, but it's fun anyway
-        
-        dispatch_once(&onceToken, ^{
-            
-            // registry is a (static) global, therefore it does not need to be declared __block
-            
-            clientMgr = [[SLClientManager alloc] init];
-            
-        });
-    return clientMgr;
+    [[SLClientManager sharedClientManager] registerSyncClient:clientKey appID:appID];
+}
+
+// enablePush: implementation is in SLObjectRegistry
+
++ (void)enablePush:(NSData *)deviceToken
+{
+    [[SLClientManager sharedClientManager] enablePush:deviceToken];
+}
+
+// handlePushNotification: real implementation is in SLObjectRegistry
+
++ (void)handlePushNotification: (NSDictionary *)userInfo
+{
+    [[SLClientManager sharedClientManager] handlePushNotification:userInfo];
+}
+
+
+// saveToDisk real implementation is in SLObjectRegistry
+
++ (void)saveToDisk
+{
+    [[SLObjectRegistry sharedObjectRegistry] saveToDisk];
+}
+
+
+// syncAllInBackgroundWithBlock: real implementation is in SLObjectRegistry
+
++ (void)syncAllInBackgroundWithBlock:(void(^)(NSError *))completion
+{
+    [[SLObjectRegistry sharedObjectRegistry] syncAllInBackgroundWithBlock: ^(NSError *error) {
+        completion(error);
+    }];
+}
+
++ (void)setSyncLag:(NSTimeInterval)lag
+{
+    [[SLObjectRegistry sharedObjectRegistry] setSyncLag:lag];
+}
+
+
++ (NSInteger)requestSyncingInBackgroundWithBlock:(void(^)(NSError *))completion
+{
+    return [[SLClientManager sharedClientManager] requestSyncingInBackgroundWithBlock:completion];
+}
+
++ (void)cancelSyncingRequest
+{
+    [[SLClientManager sharedClientManager] cancelSyncingRequest];
+}
+
++ (void)acceptSyncingRequestInBackgroundWithCode:(NSInteger)code block:(void(^)(NSError *))completion
+{
+    [[SLClientManager sharedClientManager] acceptSyncingRequestInBackgroundWithCode:code block:completion];
+}
+
++ (void)stopSyncingInBackgroundWithBlock:(void(^)(NSError *))completion
+{
+    [[SLClientManager sharedClientManager] stopSyncingInBackgroundWithBlock:completion];
+}
+
++ (BOOL)isSyncing
+{
+    return [SLClientManager sharedClientManager].syncing;
 }
 
 // registers the sync client, initializes the registry and loads the device cache, if available
@@ -135,7 +186,7 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
     [self.registry loadFromDisk];
     
     // register the user with Parse if it hasn't yet. Multiple registrations are possible if the application quits before - saveToDisk
-    // is called. THis is harmless.
+    // is called. This is harmless.
     
     if (!self.parseUserRegistered)
         [self initParseUserInBackground];
@@ -147,19 +198,55 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
         [self initSyncingInBackground];
 }
 
-- (void)unarchiveFromDictionary:(NSDictionary *)dictionary
-{
-    self.syncingArchivedState = [dictionary[@"syncing"] boolValue];
-    self.syncingGroupName = dictionary[@"syncingGroupName"];
-    self.parseUserRegistered = [dictionary[@"parseUserRegistered"] boolValue];
+#pragma mark - Internal Methods
 
+// return the shared instance of the client manager singleton
+
++ (SLClientManager *)sharedClientManager
+{
+    static SLClientManager *clientMgr = nil;
+    static dispatch_once_t  onceToken;
+    
+    // check if the registry needs to be initialized
+    
+    if (!clientMgr)
+        
+        // initialize the registry in a thread-safe manner
+        // this really isn't necessary given that the library currently isn't thread safe, but it's fun anyway
+        
+        dispatch_once(&onceToken, ^{
+            
+            // registry is a (static) global, therefore it does not need to be declared __block
+            
+            clientMgr = [[SLClientManager alloc] init];
+            
+        });
+    return clientMgr;
 }
 
-- (NSDictionary *)archiveToDictionary
+// bring back to life the client manager from the disk cache
+
+- (id)initWithCoder:(NSCoder *)aDecoder
 {
-    return @{@"syncing": @(self.syncing),
-             @"syncingGroupName" : self.syncingGroupName,
-             @"parseUserRegistered" : @(self.parseUserRegistered)};
+    // SLClientManager is a singleton class. Use the existing instance if one has already been created.
+    
+    self = [SLClientManager sharedClientManager];
+    assert(self);
+    
+    self.syncingArchivedState = [aDecoder decodeBoolForKey:kSLClientManagerSyncingKey];
+    self.syncingGroupName = [aDecoder decodeObjectForKey:kSLClientManagerSyncingGroupNameKey];
+    self.parseUserRegistered = [aDecoder decodeBoolForKey:kSLClientManagerParseUserRegisteredKey];
+     
+    return self;
+}
+
+// encode the state of the client manager to save to disk
+
+- (void)encodeWithCoder:(NSCoder *)aCoder
+{
+    [aCoder encodeBool:self.syncing forKey:kSLClientManagerSyncingKey];
+    [aCoder encodeObject:self.syncingGroupName forKey:kSLClientManagerSyncingGroupNameKey];
+    [aCoder encodeBool:self.parseUserRegistered forKey:kSLClientManagerParseUserRegisteredKey];
 }
 
 
@@ -190,7 +277,7 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
         // syncAllInBackgroundWithBlock: is serialized with respect to any ongoing operation.
         // this guards us against processing a sync push notification while another
         // operation is ongoing.
-        
+                
         if ([payload[kSLNotificationPayloadGroupNameKey] isEqualToString:self.syncingGroupName])
             [self.registry syncAllInBackgroundWithBlock: ^(NSError *error) { }];
     }
@@ -211,8 +298,6 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
         }
     }
 }
-
-
 
 - (NSInteger)requestSyncingInBackgroundWithBlock:(void (^) (NSError *))completion
 {
@@ -542,6 +627,7 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
                                                 reason:@"stopSyncingInBackground called when syncing is not enabled"
                                               userInfo:nil];
             @throw exception;
+            return;
         }
         
         // unsubscribe from channel and remove ourselves from the syncing group. We are not waiting for the completion,
@@ -623,7 +709,8 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
 
 #pragma mark - Private Methods
 
-- (id) init {
+- (id)init
+{
     self = [super init];
     if (!self)
         return nil;
@@ -673,7 +760,6 @@ static NSString * const kSLNotificationTypeApproval = @"approval";
             installation = [PFInstallation currentInstallation];
             installation[kSLInstallationUserKey] = user;
             
-            NSLog(@"initParseUser: user %@\n", user.objectId);
             [weakSelf.operationMgr savePFObjectInBackground:installation waitForConnection:TRUE block: ^(NSError *error) {
                 assert(!error);
                 weakSelf.parseUserRegistered = TRUE;
@@ -1069,14 +1155,18 @@ static NSString *makeGroupNameFromUserID(NSString *objectID)
 }
 
 
-// sendPushNotificationToChannel:message:data: sends a push notification to the specified channel and with the specified payload
+// sendPushNotificationToChannel:message:data: sends a push notification to the specified channel (except ourselves) and with the specified payload
 
 - (void)sendPushNotificationToChannel:(NSString *)channel payload:(NSDictionary *)payload
 {
     PFPush      *push;
+    PFQuery     *query;
     
     push = [[PFPush alloc] init];
-    [push setChannel:channel];
+    query = [PFInstallation query];
+    [query whereKey:kSLInstallationChannelKey equalTo:channel];
+    [query whereKey:kSLInstallationUserKey notEqualTo:[PFUser currentUser]];
+    [push setQuery:query];
     [push setData:payload];
     [push sendPushInBackground];
 }

@@ -4,23 +4,68 @@
 //  Copyright (c) 2013 Cyril Meurillon. All rights reserved.
 //
 
-#import "SLObject.h"
-#import "SLObject_Private.h"
+#import "SLObject-Internal.h"
 #import "SLObjectRegistry.h"
-#import "SLClientManager.h"
+#import "SLClientManager-Internal.h"
 #import "SLChange.h"
+#import "SLTransaction-Internal.h"
+#import "SLTransactionManager.h"
 #import "SLObjectObserving.h"
 
 
 #import <Parse/PFObject.h>
 #import <objc/runtime.h>
 
-NSString *kSLObjectObjectIDName = @"SLOObjectID";
-NSString *kSLObjectClassNameName = @"SLOClassName";
-NSString *kSLObjectValuesName = @"SLOValues";
-NSString *kSLObjectLocalChangesName = @"SLOLocalChanges";
-NSString *kSLObjectReferencesName= @"SLOReferences";
-NSString *kSLObjectDeletedName = @"SLODeleted";
+static NSString * const kSLObjectObjectIDKey = @"SLOObjectID";
+static NSString * const kSLObjectClassNameKey = @"SLOClassName";
+static NSString * const kSLObjectCommittedValuesKey = @"SLOCommittedValues";
+static NSString * const kSLObjectLocalChangesKey = @"SLOLocalChanges";
+static NSString * const kSLObjectReferencingObjectKeysKey = @"SLOReferencingObjectKeys";
+static NSString * const kSLObjectDeletedKey = @"SLODeleted";
+
+#pragma
+
+@interface SLObject ()
+
+@property (nonatomic, weak) SLObjectRegistry        *registry;
+
+@property (nonatomic) NSString                      *className;
+
+// maintained list of all references to this object
+// key is referencing object, value is a NSMutableSet of property keys referencing the object
+
+@property (nonatomic) NSMapTable                    *referencingObjectKeys;
+
+@property BOOL                                      createdFromCache;
+@property BOOL                                      createdRemotely;
+@property BOOL                                      deleted;
+@property BOOL                                      willDelete;
+
+@property (nonatomic) NSMutableDictionary           *committedValues;
+
+@property (nonatomic) NSMutableDictionary           *localChanges;
+@property (nonatomic) NSMutableDictionary           *savedLocalChanges;
+@property (nonatomic) NSMutableDictionary           *remoteChanges;
+@property (nonatomic) NSMutableDictionary           *uncommittedChanges;
+@property (nonatomic) NSMutableOrderedSet           *uncommittedReferences;
+
+@property (nonatomic) NSMutableDictionary           *keyCapturingTransactions;
+@property (nonatomic) NSMutableSet                  *referenceCapturingTransactions;
+
+- (id) init;
+
+// NSCoding protocol functions
+
+- (id)initWithCoder:(NSCoder *)coder;
+- (void)encodeWithCoder:(NSCoder *)coder;
+
+// dynamic accessors for properties
+
+- (id)dynamicValueForKey:(NSString *)key;
+- (void)dynamicSetValue:(id)value forKey:(NSString *)key logChange:(BOOL)change;
+
+
+@end
 
 
 @implementation SLObject
@@ -28,7 +73,7 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
 
 // implementation of public methods
 
-#pragma mark - Public interface implementation
+#pragma mark - Public Methods
 
 // default className implementation returns nil, this must be overriden.
 
@@ -77,72 +122,6 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
     [[SLObjectRegistry sharedObjectRegistry] removeObserver:observer forClass:self];
 }
 
-
-// registerSyncClient:appID:syncInterval: real implementation is in SLObjectRegistry
-
-+ (void)registerSyncClient:(NSString *)clientKey appID:(NSString *)appID
-{
-    [[SLClientManager sharedClientManager] registerSyncClient:clientKey appID:appID];
-}
-
-// enablePush: implementation is in SLObjectRegistry
-
-+ (void)enablePush:(NSData *)deviceToken
-{
-    [[SLClientManager sharedClientManager] enablePush:deviceToken];
-}
-
-// handlePushNotification: real implementation is in SLObjectRegistry
-
-+ (void)handlePushNotification: (NSDictionary *)userInfo
-{
-    [[SLClientManager sharedClientManager] handlePushNotification:userInfo];
-}
-
-
-// saveToDisk real implementation is in SLObjectRegistry
-
-+ (void)saveToDisk
-{
-    [[SLObjectRegistry sharedObjectRegistry] saveToDisk];
-}
-
-
-// syncAllInBackgroundWithBlock: real implementation is in SLObjectRegistry
-
-+ (void)syncAllInBackgroundWithBlock:(void(^)(NSError *))completion
-{
-    [[SLObjectRegistry sharedObjectRegistry] syncAllInBackgroundWithBlock: ^(NSError *error) {
-        completion(error);
-    }];
-}
-
-
-+ (NSInteger)requestSyncingInBackgroundWithBlock:(void(^)(NSError *))completion
-{
-    return [[SLClientManager sharedClientManager] requestSyncingInBackgroundWithBlock:completion];
-}
-
-+ (void)cancelSyncingRequest
-{
-    [[SLClientManager sharedClientManager] cancelSyncingRequest];
-}
-
-+ (void)acceptSyncingRequestInBackgroundWithCode:(NSInteger)code block:(void(^)(NSError *))completion
-{
-    [[SLClientManager sharedClientManager] acceptSyncingRequestInBackgroundWithCode:code block:completion];
-}
-
-+ (void)stopSyncingInBackgroundWithBlock:(void(^)(NSError *))completion
-{
-    [[SLClientManager sharedClientManager] stopSyncingInBackgroundWithBlock:completion];
-}
-
-+ (BOOL)isSyncing
-{
-    return [SLClientManager sharedClientManager].syncing;
-}
-
 // objectWithValues: creates a new database object of the sublass it is invoked on
 
 + (SLObject *)objectWithValues:(NSDictionary *)values
@@ -154,6 +133,17 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
     
     if (![self className])
         return nil;
+    
+    // objects cannot be created in transactions
+
+    if ([[SLTransactionManager sharedTransactionManager] currentTransaction]) {
+        NSException     *exception;
+        exception = [NSException exceptionWithName:NSInvalidArgumentException
+                                            reason:@"objectWithValues: called inside a transaction block"
+                                          userInfo:nil];
+        @throw exception;
+        return nil;
+    }
     
     // allocate and init instance
     // objectID is set to nil until a database object is created on the store
@@ -167,9 +157,9 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
     instance.createdRemotely = FALSE;
     
     // create the value dictionary
-    
-    instance.values = [NSMutableDictionary dictionary];
-    if (!instance.values)
+
+    instance.committedValues = [NSMutableDictionary dictionary];
+    if (!instance.committedValues)
         return nil;
     
     if (values)
@@ -178,12 +168,12 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
             value = values[key];
             if (value == [NSNull null])
                 value = nil;
-            [instance setDictionaryValue:values[key] forKey:key];
+            [instance setDictionaryValue:values[key] forKey:key speculative:FALSE change:nil];
         }
     
     // add new object to the registry
     
-    [instance.registry addObject:instance];
+    [instance.registry insertObject:instance];
     
     // notify the observers of object creation
     
@@ -192,34 +182,15 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
         
         // notify the beginning of change notifications
         
-        for(NSObject<SLObjectObserving> *observer in observers)
-            if ([observer respondsToSelector:@selector(willChangeObjectsForClass:)])
-                [observer willChangeObjectsForClass:[self class]];
+        [instance.registry notifyObserversWillChangeObjects:observers];
         
         // notify of the object creation
         
-        for(NSObject<SLObjectObserving> *observer in observers) {
-            
-            // if the object has been deleted by an observer, no further notification to send
-            if (!instance.operable)
-                break;
-            
-            // keep track of the last observer notified of the object creation, so that reentrant
-            // object operations (e.g. setting an attribute) do not reveal the object to observers
-            // that have not been notified of its creation yet
-            
-            instance.lastObserverNotified = observer;
-            if ([observer respondsToSelector:@selector(didCreateObject:remotely:)])
-                [observer didCreateObject:instance remotely:FALSE];
-        }
-        
-        instance.lastObserverNotified = nil;
+        [instance.registry notifyObserversDidCreateObject:instance remote:FALSE];
     
-        // notify the end of change notifications (in reverse order of registration)
+        // notify the end of change notifications
         
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator])
-            if ([observer respondsToSelector:@selector(didChangeObjectsForClass:)])
-                [observer didChangeObjectsForClass:[self class]];
+        [instance.registry notifyObserversDidChangeObjects:observers];
     }
     
     // schedule a sync as we have modified the database
@@ -234,120 +205,80 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
 
 - (void)delete
 {
-    NSArray             *observers;
+    NSArray         *observers;
     
-    // if the object is not in an operable state, gracefully return
+    // if the object is not in an modifiable state, gracefully return
     
-    if (![self modifiable])
+    if (!self.modifiable)
         return;
+
+    // objects cannot be deleted in transaction blocks
     
-    self.willDelete = TRUE;
+    if ([[SLTransactionManager sharedTransactionManager] currentTransaction]) {
+        NSException     *exception;
+        exception = [NSException exceptionWithName:NSInvalidArgumentException
+                                            reason:@"delete called inside a transaction block"
+                                          userInfo:nil];
+        @throw exception;
+        return;
+    }
+    
+    [self startDeletion];
+    
+    // handle the transactions that capture and change the deleted object
+    
+    [self handleTransactionsForDeletedObject:TRUE];
     
     // set to nil all reference to the deleted object.
-    // the reference list (NSCountedSet) holds strong references. It will be gradually
-    // depopulated as the references are nil-ified.
     // all modified objects are marked changed and will be saved on the next sync
     
     // iterate over a copy of the reference list and value keys as they are modified by the body of the loop
     
-    for(SLObject *object in [self.references copy]) {
-        for (NSString *key in [object.values copy]) {
-            if ([object dictionaryValueForKey:key] == self) {
+    for(SLObject *object in [self.referencingObjectKeys copy]) {
+        NSSet       *keys;
+        
+        keys = [self.referencingObjectKeys objectForKey:object];
+        for (NSString *key in [keys copy]) {
+            if ([object dictionaryValueForKey:key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE] == self) {
                 
-                // nil-ify the reference through the public accessor so that proper change tracking and notification is performed
+                // set the refering to nil using the public accessor so that proper change tracking and notification is performed
                 
-                [object setValue:nil forKey:key];
+                [object dynamicSetValue:nil forKey:key logChange:TRUE];
             }
         }
     }
-    assert([self.references count] == 0);
+    assert([self.referencingObjectKeys count] == 0);
     
     // notify the observers
     
     observers = [self.registry observersForClassWithName:self.className];
     if (observers) {
         
-        BOOL        found;
-        
         // notify the beginning of change notifications
         
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
-            if ([observer respondsToSelector:@selector(willChangeObjectsForClass:)])
-                [observer willChangeObjectsForClass:[self class]];
-            
-            // if this is an object operation issued from within the notification for the object creation, do not notify beyond the
-            // observer notified of the object creation
-            
-            if (observer == self.lastObserverNotified)
-                break;
-        }
+        [self.registry notifyObserversWillChangeObjects:observers];
         
         // notify of the object deletion (in reverse order of registration)
         
-        found = FALSE;
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
-            
-            // in case of an object operation issued from within the notification of the object creation, skip all observers that have not been notified
-            
-            if (!found && self.lastObserverNotified && (observer != self.lastObserverNotified))
-                continue;
-            found = TRUE;
-
-            // if the object has been deleted by an observer, no further notification to send
-            
-            if (!self.operable)
-                break;
-
-            if ([observer respondsToSelector:@selector(willDeleteObject:remotely:)])
-                [observer willDeleteObject:self remotely:FALSE];
-        }
+        [self.registry notifyObserversWillDeleteObject:self remote:FALSE];
         
         // notify the end of change notifications
         
-        found = FALSE;
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
-            
-            // in case of an object operation issued from within the notification of the object creation, skip all observers that have not been notified
-            
-            if (!found && self.lastObserverNotified && (observer != self.lastObserverNotified))
-                continue;
-            found = TRUE;
-            
-            if ([observer respondsToSelector:@selector(didChangeObjectsForClass:)])
-                [observer didChangeObjectsForClass:[self class]];
-        }
+        [self.registry notifyObserversDidChangeObjects:observers];
+        
     }
     
+    // mark the object locally deleted in the registry
     
-    // mark the object for deletion
+    [self.registry markObjectDeleted:self];
+
+    // complete the deletion (this part is common to local and remote deletions)
     
-    self.deleted = TRUE;
-    
-    // set to nil all references this object makes to other objects.
-    // we make a copy of the value keys as we're modifying the dictionary while iterating over it
-    
-    for(NSString *key in [self.values allKeys]) {
-        id          value;
-        value = [self dictionaryValueForKey:key];
-        if (!value || ![SLObject isRelation:value])
-            continue;
-        
-        // perform the change through the private accessor, as we don't want change tracking nor notifications.
-        
-        [self setDictionaryValue:nil forKey:key];
-    }
-    
-    // forget about any local changes to the object
-    
-    self.localChanges = nil;
-    
-    // remove object from registry
-    
-    [self.registry removeObject:self];
+    [self completeDeletion];
 }
 
 
-#pragma mark - Private interface implementation
+#pragma mark - Library Internal Methods
 
 #pragma mark Lifecycle
 
@@ -362,17 +293,20 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
     _objectID = nil;
     _className = nil;
     _databaseObject = nil;
-    _values = nil;
-    _references = [NSCountedSet set];
-    if (!_references)
+    _referencingObjectKeys = [NSMapTable strongToStrongObjectsMapTable];
+    if (!_referencingObjectKeys)
         return nil;
+    _deleted = FALSE;
+    _committedValues = nil;
+    _keyCapturingTransactions = nil;
+    _referenceCapturingTransactions = nil;
+    _uncommittedChanges = nil;
     _localChanges = nil;
     _remoteChanges = nil;
     _savedLocalChanges = nil;
     _lastObserverNotified = nil;
     _willDelete = FALSE;
-    _deleted = FALSE;
-    _index = 0;
+    _depth = 0;
     _createdFromCache = FALSE;
     _createdRemotely = FALSE;
     
@@ -392,22 +326,75 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
         return nil;
     
     _registry = [SLObjectRegistry sharedObjectRegistry];
-    _objectID = [coder decodeObjectForKey:kSLObjectObjectIDName];
-    _className = [coder decodeObjectForKey:kSLObjectClassNameName];
-    _values = [coder decodeObjectForKey:kSLObjectValuesName];
-    _localChanges = [coder decodeObjectForKey:kSLObjectLocalChangesName];
-    _references = [coder decodeObjectForKey:kSLObjectReferencesName];
-    _deleted = [coder decodeBoolForKey:kSLObjectDeletedName];
+    _objectID = [coder decodeObjectForKey:kSLObjectObjectIDKey];
+    _className = [coder decodeObjectForKey:kSLObjectClassNameKey];
+    _databaseObject = nil;
+    _referencingObjectKeys = [coder decodeObjectForKey:kSLObjectReferencingObjectKeysKey];
+    _deleted = [coder decodeBoolForKey:kSLObjectDeletedKey];
+    _committedValues = [coder decodeObjectForKey:kSLObjectCommittedValuesKey];
+    _keyCapturingTransactions = nil;
+    _referenceCapturingTransactions = nil;
+    _uncommittedChanges = nil;
+    _localChanges = [coder decodeObjectForKey:kSLObjectLocalChangesKey];
     _remoteChanges = nil;
-    _willDelete = FALSE;
     _savedLocalChanges = nil;
-    _index = 0;
+    _lastObserverNotified = nil;
+    _willDelete = FALSE;
+    _depth = 0;
     _createdFromCache = TRUE;
     _createdRemotely = FALSE;
     
     return self;
 }
 
+// objectFromExistingWithClassName:objectID: instantiates an existing object, but leaves its value directory empty.
+// this is the first part of remote object instantiation
+
++ (SLObject *)objectFromExistingWithClassName:(NSString *)className objectID:(NSString *)objectID
+{
+    id                  subclass;
+    SLObjectRegistry    *registry;
+    SLObject            *instance;
+    
+    registry = [SLObjectRegistry sharedObjectRegistry];
+    
+    subclass = [registry classForRegisteredClassWithName:className];
+    if (!subclass)
+        subclass = [SLObject class];
+    instance = [[subclass alloc] init];
+    
+    // add the object to the registry
+    
+    instance.objectID = objectID;
+    instance.className = className;
+    instance.createdRemotely = TRUE;
+    
+    // add this instance to the registry
+    
+    [registry insertObject:instance];
+    
+    return instance;
+}
+
+
+// populatWithDictionary: assign a value directory to an object. this is the second part of remote object instantiation
+
+- (void)populateWithDictionary:(NSDictionary *)databaseDictionary
+{
+    // instantiate the dictionary value
+    
+    self.committedValues = [NSMutableDictionary dictionary];
+    
+    // iterate over the database values and populate the dictionary
+    
+    for (NSString *key in databaseDictionary) {
+        id value;
+        
+        value = [self databaseToDictionaryValue:databaseDictionary[key]];
+        [self setDictionaryValue:value forKey:key speculative:FALSE change:nil];
+    }
+    
+}
 
 // encode an object to save to the local cache file. the archiving class of an object is its natural class.
 // this method must not be overriden.
@@ -421,17 +408,102 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
                                  [self.registry localPersistedPropertiesForClassWithName:self.className]])
         for(NSString *key in properties) {
             id      value;
-            value = self.values[key];
+            value = self.committedValues[key];
             if (value)
                 persistedValues[key] = value;
         }
     
-    [coder encodeObject:self.objectID forKey:kSLObjectObjectIDName];
-    [coder encodeObject:self.className forKey:kSLObjectClassNameName];
-    [coder encodeObject:persistedValues forKey:kSLObjectValuesName];
-    [coder encodeObject:self.localChanges forKey:kSLObjectLocalChangesName];
-    [coder encodeObject:self.references forKey:kSLObjectReferencesName];
-    [coder encodeBool:self.deleted forKey:kSLObjectDeletedName];
+    [coder encodeObject:self.objectID forKey:kSLObjectObjectIDKey];
+    [coder encodeObject:self.className forKey:kSLObjectClassNameKey];
+    [coder encodeObject:persistedValues forKey:kSLObjectCommittedValuesKey];
+    [coder encodeObject:self.localChanges forKey:kSLObjectLocalChangesKey];
+    [coder encodeObject:self.referencingObjectKeys forKey:kSLObjectReferencingObjectKeysKey];
+    [coder encodeBool:self.deleted forKey:kSLObjectDeletedKey];
+}
+
+- (void)handleTransactionsForDeletedObject:(BOOL)local
+{
+    // if this is a local deletion, the transactions that have captured properties of the
+    // deleted object are still valid. But they need to forget all references to the object.
+
+    // if this is a remote deletion, the transactions that have captured properties of the
+    // deleted object must be voided because the transactions were speculatively executed
+    // while the object still existed.
+    
+    for(NSString *key in self.keyCapturingTransactions) {
+        
+        NSOrderedSet        *capturingTransactions;
+        
+        capturingTransactions = self.keyCapturingTransactions[key];
+        for(SLTransaction *capturingTransaction in capturingTransactions)
+            if (local)
+                [capturingTransaction forgetCapturedKeysForObject:self];
+            else
+                [capturingTransaction markVoided];
+    }
+    self.keyCapturingTransactions = nil;
+    
+    // if this is a local deletion, the transactions that have captured references to the
+    // deleted object are still valid.
+    
+    // if this is a remote deletion, the transactions that have captured references to the
+    // deleted object must be voided because the transactions were speculatively executed
+    // while the object still existed.
+
+    if (!local)
+        for(SLTransaction *capturingTransaction in self.referenceCapturingTransactions)
+            [capturingTransaction markVoided];
+    self.referenceCapturingTransactions = nil;
+    
+    // the transactions that have uncommitted references to the deleted object are still
+    // valid. But they need to adjust those changes to point to nil instead.
+    
+    for(SLChange *change in self.uncommittedReferences)
+        change.nValue = nil;
+    self.uncommittedReferences = nil;
+    
+    // the transactions that have modified the deleted object must drop their changes
+    // to the object
+    
+    for(NSString *key in self.uncommittedChanges) {
+        
+        NSOrderedSet        *uncommittedChanges;
+        
+        uncommittedChanges = self.uncommittedChanges[key];
+        for(SLChange *uncommittedChange in uncommittedChanges)
+            [uncommittedChange.issuingTransaction forgetUncommittedKeysForObject:self];
+    }
+    self.uncommittedChanges = nil;
+}
+
+- (void)startDeletion
+{
+    self.willDelete = TRUE;
+}
+
+- (void)completeDeletion
+{
+    // mark the object for deletion
+    
+    self.deleted = TRUE;
+    
+    // set to nil all references this object makes to other objects. this ensures that the object is
+    // removed from all referencing object lists
+    
+    for(NSString *key in [self.committedValues allKeys]) {
+        id          value;
+        value = [self dictionaryValueForKey:key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE];
+        if (!value || ![SLObject isRelation:value])
+            continue;
+        
+        // perform the change through the internal accessor, as we don't want change tracking nor notifications.
+        
+        [self setDictionaryValue:nil forKey:key speculative:FALSE change:nil];
+    }
+    
+    // forget about any local changes to the object
+    
+    self.localChanges = nil;
 }
 
 
@@ -457,6 +529,217 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
 
 #pragma mark Object Value Management
 
+- (void)saveLocalChanges
+{
+    self.savedLocalChanges = self.localChanges;
+    self.localChanges = [NSMutableDictionary dictionary];
+}
+
+- (void)doneWithSavedLocalChanges:(BOOL)merge
+{
+    if (merge) {
+        for(NSString *key in self.savedLocalChanges) {
+            SLChange        *change;
+            
+            change = self.savedLocalChanges[key];
+            
+            // preserve the change if the property hasn't been changed since it was saved
+            
+            if (!self.localChanges[key])
+                self.localChanges[key] = change;
+        }
+    }
+    self.savedLocalChanges = nil;
+}
+
+- (void)removeAllRemoteChanges
+{
+    self.remoteChanges = nil;
+}
+
+- (void)addChange:(SLChange *)change
+{
+    NSString        *key;
+    
+    key = change.key;
+
+    if (change.issuingTransaction) {
+        
+        NSMutableOrderedSet     *changes;
+        
+        if (!self.uncommittedChanges) {
+            self.uncommittedChanges = [NSMutableDictionary dictionary];
+            assert(self.uncommittedChanges);
+        }
+        changes = self.uncommittedChanges[key];
+        if (!changes) {
+            changes = [NSMutableOrderedSet orderedSet];
+            assert(changes);
+            self.uncommittedChanges[key] = changes;
+        }
+        
+        [changes addObject:change];
+        
+    } else {
+        
+        NSMutableDictionary     *changes;
+        
+        if (change.local) {
+
+            if (!self.localChanges) {
+                self.localChanges = [NSMutableDictionary dictionary];
+                assert(self.localChanges);
+            }
+            changes = self.localChanges;
+        } else {
+            if (!self.remoteChanges) {
+                self.remoteChanges = [NSMutableDictionary dictionary];
+                assert(self.remoteChanges);
+            }
+            changes = self.remoteChanges;
+        }
+        
+        changes[key] = change;
+        
+        // remember the object was modified
+        
+        [self.registry markObjectModified:self local:change.local];
+    }
+}
+
+- (void)removeChange:(SLChange *)change
+{
+    NSString        *key;
+    
+    key = change.key;
+
+    if (change.issuingTransaction) {
+        
+        NSMutableOrderedSet     *changes;
+        
+        changes = self.uncommittedChanges[key];
+        assert(changes);
+        assert([changes containsObject:change]);
+        [changes removeObject:change];
+        if ([changes count] == 0) {
+            [self.uncommittedChanges removeObjectForKey:key];
+            if ([self.uncommittedChanges count] == 0)
+                self.uncommittedChanges = nil;
+        }
+        
+    } else {
+        
+        NSMutableDictionary     *changes;
+        
+        if (change.local)
+            changes = self.localChanges;
+        else
+            changes = self.remoteChanges;
+        
+        assert(changes[key]);
+        [changes removeObjectForKey:key];
+        
+        // drop the object from the modified list if no more change left for this object
+        
+        if ([changes count] == 0)
+            [self.registry markObjectUnmodified:self local:change.local];
+    }
+}
+
+- (NSArray *)uncommittedKeys
+{
+    return [self.uncommittedChanges allKeys];
+}
+
+- (SLChange *)lastUncommittedChangeForKey:(NSString *)key
+{
+    NSOrderedSet    *keyChanges;
+    
+    keyChanges = [self.uncommittedChanges objectForKey:key];
+    return keyChanges.lastObject;
+}
+
+- (NSArray *)referencingObjects
+{
+    return [[self.referencingObjectKeys keyEnumerator] allObjects];
+}
+
+- (NSSet *)referencingKeysForObject:(SLObject *)object
+{
+    return [self.referencingObjectKeys objectForKey:object];
+}
+
+- (void)addReferenceCapturingTransaction:(SLTransaction *)transaction
+{
+    NSMutableSet        *capturingTransactions;
+    
+    capturingTransactions = self.referenceCapturingTransactions;
+    if (!capturingTransactions) {
+        capturingTransactions = [NSMutableSet set];
+        assert(capturingTransactions);
+        self.referenceCapturingTransactions = capturingTransactions;
+    }
+    [capturingTransactions addObject:transaction];
+}
+
+- (void)removeReferenceCapturingTransaction:(SLTransaction *)transaction
+{
+    NSMutableSet        *capturingTransactions;
+
+    capturingTransactions = self.referenceCapturingTransactions;
+    assert(capturingTransactions);
+    assert([capturingTransactions containsObject:transaction]);
+    [capturingTransactions removeObject:transaction];
+    if ([capturingTransactions count] == 0)
+        self.referenceCapturingTransactions = nil;
+}
+
+- (void)addCapturingTransaction:(SLTransaction *)transaction forKey:(NSString *)key
+{
+    NSMutableOrderedSet     *capturingTransactions;
+    
+    if (!self.keyCapturingTransactions) {
+        self.keyCapturingTransactions = [NSMutableDictionary dictionary];
+        assert(self.keyCapturingTransactions);
+    }
+    capturingTransactions = self.keyCapturingTransactions[key];
+    if (!capturingTransactions) {
+        capturingTransactions = [NSMutableOrderedSet orderedSet];
+        assert(capturingTransactions);
+        self.keyCapturingTransactions[key] = capturingTransactions;
+    }
+    [capturingTransactions addObject:transaction];
+}
+
+- (void)removeCapturingTransaction:(SLTransaction *)transaction forKey:(NSString *)key
+{
+    NSMutableOrderedSet     *capturingTransactions;
+    
+    capturingTransactions = self.keyCapturingTransactions[key];
+    assert([capturingTransactions containsObject:transaction]);
+    [capturingTransactions removeObject:transaction];
+    if ([capturingTransactions count] == 0)
+        [self.keyCapturingTransactions removeObjectForKey:key];
+}
+
+- (NSOrderedSet *)capturingTransactionsForKey:(NSString *)key
+{
+    return [self.keyCapturingTransactions objectForKey:key];
+}
+
+- (void)voidKeyCapturingTransactions
+{
+    for(NSString *key in self.keyCapturingTransactions)
+        for(SLTransaction *transaction in self.keyCapturingTransactions[key])
+            [transaction markVoided];
+}
+
+- (void)voidTransactionsCapturingKey:(NSString *)key
+{
+    for(SLTransaction *transaction in self.keyCapturingTransactions[key])
+        [transaction markVoided];
+}
+
 
 // accessor functions for dynamic object attributes
 
@@ -465,10 +748,14 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
 
 - (id)dynamicValueForKey:(NSString *)key
 {
+    id                  value;
+
     if (!self.operable)
         return nil;
+
+    value = [self dictionaryValueForKey:key useSpeculative:TRUE wasSpeculative:NULL capture:TRUE];
     
-    return [self dictionaryValueForKey:key];
+    return value;
 }
 
 // dynamicSetValueForKey:logChange: is the implementation of the setter accessors for object properties of all storage
@@ -480,7 +767,9 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
 {
     id              oldValue;
     NSArray         *observers;
-    BOOL            found;
+    SLTransaction   *transaction;
+    SLChange        *change;
+    BOOL            speculative;
     
     if (!self.modifiable)
         return;
@@ -495,132 +784,70 @@ NSString *kSLObjectDeletedName = @"SLODeleted";
 
     // retrieve the current (old) value
 
-    oldValue = [self dictionaryValueForKey:key];
+    oldValue = [self dictionaryValueForKey:key useSpeculative:TRUE wasSpeculative:&speculative capture:FALSE];
+
+    // if this write is not part of a transaction and it is following a speculative write (synchronous write after speculative write),
+    // we need to make it a speculative write too. This is necessary to preserve the ordering of write operations in case the speculative
+    // write gets cancelled and the transaction retried.
+    // note that the ordering of synchronous writes with respect to asynchronous writes is not guaranteed.
     
-    // if value isn't changed, nothing to do
+    transaction = [[SLTransactionManager sharedTransactionManager] currentTransaction];
+    if (!transaction && speculative)
+        transaction = [SLTransaction speculativeTransaction];
     
-    if ((oldValue == value) || (value && [value isEqual:oldValue]))
-        return;
+    // log the change if 1) it is part of a transaction
+    // or 2) the object is replicated in the cloud and the property synced.
     
-    // don't log the change if 1) the object is new and hasn't been uploaded to the database yet (no need for property-level reconciliation)
-    // or 2) the property set is not of the cloud persisted storage class
+    change = nil;
+    if (transaction || (self.objectID && withChange))
+        change = [SLChange transactionChangeWithObject:self key:key oldValue:oldValue newValue:value transaction:transaction];
     
-    if (self.objectID && withChange) {
+    // notify the observers if
+    // 1) this change isn't part of a transaction
+    // or 2) this change is part of a synchronous transaction
+    
+    if (!transaction || transaction.speculative) {
+
+        // notify the observers, part I
         
-        [SLChange changeWithObject:self local:TRUE key:key oldValue:oldValue newValue:value when:[NSDate date]];
-    
-    }
-    
-    // notify the observers, part I
-    
-    observers = [self.registry observersForClassWithName:self.className];
-    if (observers) {
-        
-        // notify the beginning of change notifications
-        
-        for(NSObject<SLObjectObserving> *observer in observers) {
-            if ([observer respondsToSelector:@selector(willChangeObjectsForClass:)])
-                [observer willChangeObjectsForClass:[self class]];
+        observers = [self.registry observersForClassWithName:self.className];
+        if (observers) {
             
-            // if this is an object operation issued from within the notification for the object creation, do not notify beyond the
-            // observer notified of the object creation
+            // notify the beginning of change notifications
             
-            if (observer == self.lastObserverNotified)
-                break;
-        }
-        
-        // notify prior the value change (in reverse order of registration)
-        
-        found = FALSE;
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
+            [self.registry notifyObserversWillChangeObjects:observers];
             
-            // in case of an object operation issued from within the notification of the object creation, skip all observers that have not been notified
+            // notify prior the value change (in reverse order of registration)
             
-            if (!found && self.lastObserverNotified && (observer != self.lastObserverNotified))
-                continue;
-            found = TRUE;
-            
-            // if the object has been deleted by an observer, no further notification to send
-            
-            if (!self.operable)
-                break;
-            
-            if ([observer respondsToSelector:@selector(willChangeObjectValue:forKey:oldValue:newValue:remotely:)])
-                [observer willChangeObjectValue:self forKey:key oldValue:oldValue newValue:value remotely:FALSE];
+            [self.registry notifyObserversWillChangeObjectValue:self forKey:key oldValue:oldValue newValue:value remote:FALSE];
         }
     }
-    
+        
     // set the property to the new value
     
-    [self setDictionaryValue:value forKey:key];
-    
+    [self setDictionaryValue:value forKey:key speculative:(transaction != nil) change:change];
+        
     // notify the observers, part II
     
-    if (observers) {
+    if (!transaction || transaction.speculative) {
         
-        // notify after the value change
-        
-        for(NSObject<SLObjectObserving> *observer in observers) {
+        if (observers) {
             
-            // if the object has been deleted by an observer, no further notification to send
+            // notify after the value change
             
-            if (!self.operable)
-                break;
+            [self.registry notifyObserversDidChangeObjectValue:self forKey:key oldValue:oldValue newValue:value remote:FALSE];
             
-            if ([observer respondsToSelector:@selector(didChangeObjectValue:forKey:oldValue:newValue:remotely:)])
-                [observer didChangeObjectValue:self forKey:key oldValue:oldValue newValue:value remotely:FALSE];
+            // notify the end of change notifications (in reverse order of registration)
             
-            // if this is an object operation issued from within a notification for the object creation, do not notify beyond the
-            // observer notified of the object creation
-            
-            if (observer == self.lastObserverNotified)
-                break;
+            [self.registry notifyObserversDidChangeObjects:observers];
         }
         
-        // notify the end of change notifications (in reverse order of registration)
+        // schedule a sync soon if we just modified a cloud persisted property
         
-        found = FALSE;
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
-            
-            // if the object has been deleted by an observer, no further notification to send
-
-            if (!found && self.lastObserverNotified && (observer != self.lastObserverNotified))
-                continue;
-            found = TRUE;
-            if ([observer respondsToSelector:@selector(didChangeObjectsForClass:)])
-                [observer didChangeObjectsForClass:[self class]];
-        }
+        if ([[self.registry cloudPersistedPropertiesForClassWithName:self.className] containsObject:key])
+            [self.registry scheduleSync];
     }
-    
-    // schedule a sync soon if we just modified a cloud persisted property
-    
-    if ([[self.registry cloudPersistedPropertiesForClassWithName:self.className] containsObject:key])
-        [self.registry scheduleSync];
 }
-
-
-// isDynamicProperty is helper function that verifies that the property is @dynamic
-
-static BOOL isDynamicProperty(const char *attributes)
-{
-    NSUInteger     len, i;
-    
-    len = strlen(attributes);
-    if (len < 2)
-        return FALSE;
-    
-    for(i=2; i<len-1; i++)
-        if ((attributes[i] == ',') && (attributes[i+1] == 'D')) {
-            
-            // make sure property type is either scalar or object
-            
-            assert(strchr("csilqCSILQfdB@", attributes[1]));
-            return TRUE;
-        }
-    
-    return FALSE;
-}
-
 
 // allProperties is a helper method that returns an array with all the object properties
 // it also ensures that all object properties are @dynamic
@@ -644,6 +871,199 @@ static BOOL isDynamicProperty(const char *attributes)
     free(properties);
     return array;
 }
+
+- (NSArray *)dictionaryKeys
+{
+    return [self.committedValues allKeys];
+}
+
+// retrieve a dictionary value
+// [NSNUll null] values are converted to nil
+
+- (id)dictionaryValueForKey:(NSString *)key useSpeculative:(BOOL)useSpeculative wasSpeculative:(BOOL *)wasSpeculative capture:(BOOL)capture
+{
+    id              value;
+    SLTransaction   *transaction;
+    
+    value = nil;
+    if (![SLClientManager sharedClientManager].syncing) {
+        capture = FALSE;
+        useSpeculative = FALSE;
+        if (wasSpeculative)
+            *wasSpeculative = FALSE;
+    }
+    if (useSpeculative) {
+        value = [self.registry uncommittedValueForObject:self key:key];
+        if (wasSpeculative)
+            *wasSpeculative = (value != nil);
+    }
+    if (!value)
+        value = self.committedValues[key];
+    if (capture) {
+        transaction = [[SLTransactionManager sharedTransactionManager] currentTransaction];
+        if (transaction) {
+            [transaction captureKey:key forObject:self];
+            [self addCapturingTransaction:transaction forKey:key];
+            if ([SLObject isRelation:value]) {
+                SLObject    *referencedObject;
+                
+                referencedObject = (SLObject *)value;
+                [transaction captureReference:referencedObject];
+                [referencedObject addReferenceCapturingTransaction:transaction];
+            }
+        }
+    }
+    
+    // convert from NSNull back to nil if needed
+    
+    if (value == [NSNull null])
+        value = nil;
+    return value;
+}
+
+
+// store a dictionary value
+// nil values are convert to [NSNUll null]
+// reference lists are maintained
+
+- (void)setDictionaryValue:(id)value forKey:(NSString *)key speculative:(BOOL)speculative change:(SLChange *)change
+{
+    id          oldValue;
+    BOOL        wasSpeculative;
+    
+    // no need for speculative execution if syncing is off
+    
+    if (![SLClientManager sharedClientManager].syncing)
+        speculative = FALSE;
+    
+    // retrieve the old (current) value and convert from NSNull back to nil if needed
+
+    oldValue = [self dictionaryValueForKey:key useSpeculative:speculative wasSpeculative:&wasSpeculative capture:FALSE];
+    
+    // maintain the reference lists
+
+    NSMutableSet        *keys;
+    SLObject            *relation;
+    
+    if ([SLObject isRelation:oldValue]) {
+        relation = (SLObject *)oldValue;
+        if (!speculative) {
+            keys = [relation.referencingObjectKeys objectForKey:self];
+            assert(keys);
+            [keys removeObject:key];
+            if ([keys count] == 0)
+                [relation.referencingObjectKeys removeObjectForKey:self];
+        }
+    }
+    
+    if ([SLObject isRelation:value]) {
+        relation = (SLObject *)value;
+        if (speculative) {
+            [relation.uncommittedReferences addObject:change];
+        } else {
+            keys = [relation.referencingObjectKeys objectForKey:self];
+            if (!keys) {
+                keys = [NSMutableSet set];
+                assert(keys);
+                [relation.referencingObjectKeys setObject:keys forKey:self];
+            }
+            [keys addObject:key];
+        }
+    }
+
+    // convert nil values to [NSNull null];
+    
+    if (!value)
+        value = [NSNull null];
+
+    if (speculative) {
+        [self.registry setUncommittedValue:value forObject:self key:key];
+        
+        // create an entry in the committed value dictionary if none exists
+        
+        if (!self.committedValues[key])
+            self.committedValues[key] = [NSNull null];
+    } else
+        self.committedValues[key] = value;
+}
+
+
+// utility method to convert a database value to a dictionary value.
+// PFObject * are converted to SLObject *.
+// [NSNull null] is converted to nil
+// All other object types/values are left untouched.
+
+- (id)databaseToDictionaryValue:(id)value
+{
+    PFObject    *dbObject;
+    
+    if (value == [NSNull null])
+        return nil;
+    
+    // convert if attribute is a relation (class of PFObject)
+    
+    if ([SLObject isDBRelation:value]) {
+        dbObject = (PFObject *)value;
+        
+        // this returns nil if the object has an unknown objectID. this may
+        // happen if a reference to a deleted object is left dangling in the database
+        // (see discussion under resolveDanglingReferencesToDeletedObjects:local:)
+        
+        return [self.registry objectForID:dbObject.objectId];
+    }
+    
+    return value;
+}
+
+
+// utility method to convert a dictionary value to a database value.
+// SLObject * are converted to PFObject *.
+// nil values are converted to [NSNull null]
+// All other object types/values are left untouched.
+
+- (id)dictionaryToDatabaseValue:(id)value
+{
+    SLObject        *relation;
+    
+    // convert if attribute is a relation (class of SLObject)
+    // a reference to the same database object is created
+    
+    if ([SLObject isRelation:value]) {
+        relation = (SLObject *)value;
+        
+        // lazily create a database object for the relation
+        
+        if (!relation.databaseObject) {
+            assert(relation.objectID);
+            relation.databaseObject = [PFObject objectWithoutDataWithClassName:relation.className objectId:relation.objectID];
+            assert(relation.databaseObject);
+        }
+        return relation.databaseObject;
+    }
+    
+    if (!value)
+        return [NSNull null];
+
+    return value;;
+}
+
+
+// utility method to check whether a given attribute is a database relation
+
++ (BOOL)isDBRelation:(id)attribute
+{
+    return (attribute && [attribute isKindOfClass:[PFObject class]]);
+}
+
+
+// utility method to check whether a given attribute is a memory relation
+
++ (BOOL)isRelation:(id)attribute
+{
+    return (attribute && [attribute isKindOfClass:[SLObject class]]);
+}
+
+#pragma mark - Private Methods
 
 
 // xxxGetterGlue are the glue functions for getter accessors
@@ -757,7 +1177,7 @@ static bool boolGetterGlue(id self, SEL _cmd)
     NSNumber        *number;
     
     // this returns a BOOL rather than a bool, but that's safe
-
+    
     number = objectGetterGlue(self, _cmd);
     return [number boolValue];
 }
@@ -926,6 +1346,28 @@ static void boolSetterGlueWithoutChange(id self, SEL _cmd, bool value)
     objectSetterGlueWithoutChange(self, _cmd, [NSNumber numberWithBool:value]);
 }
 
+// isDynamicProperty is helper function that verifies that the property is @dynamic
+
+static BOOL isDynamicProperty(const char *attributes)
+{
+    NSUInteger     len, i;
+    
+    len = strlen(attributes);
+    if (len < 2)
+        return FALSE;
+    
+    for(i=2; i<len-1; i++)
+        if ((attributes[i] == ',') && (attributes[i+1] == 'D')) {
+            
+            // make sure property type is either scalar or object
+            
+            assert(strchr("csilqCSILQfdB@", attributes[1]));
+            return TRUE;
+        }
+    
+    return FALSE;
+}
+
 // generate the dynamic attribute accessor for a subclass
 
 + (void)generateDynamicAccessors
@@ -1018,7 +1460,7 @@ static void boolSetterGlueWithoutChange(id self, SEL _cmd, bool value)
             // setters for all other properties do no need to keep a change log
             
             // identify the correct setter accessor based on the property type
-
+            
             if (properties == [registry cloudPersistedPropertiesForClassWithName:className]) {
                 switch(type) {
                     case 'c':
@@ -1114,194 +1556,12 @@ static void boolSetterGlueWithoutChange(id self, SEL _cmd, bool value)
                         assert(NULL);
                 }
             }
-           
+            
             sprintf(&buffer[0], "set%c%s:", toupper(name[0]), &name[1]);
             selector = sel_registerName(&buffer[0]);
             sprintf(&buffer[0], "v@:%c", type);
             class_addMethod(self, selector, implementation, &buffer[0]);
         }
-}
-
-
-// retrieve a dictionary value
-// [NSNUll null] values are converted to nil
-
-- (id)dictionaryValueForKey:(NSString *)key
-{
-    id      value;
-    
-    // lookup the value directory
-    // this is nil if the value hasn't been set before
-    
-    value = self.values[key];
-    
-    // convert from NSNull back to nil if needed
-    
-    if ((id)value == [NSNull null])
-        value = nil;
-    return value;
-}
-
-
-// store a dictionary value
-// nil values are convert to [NSNUll null]
-// reference lists are maintained
-
-- (void)setDictionaryValue:(id)value forKey:(NSString *)key
-{
-    id          oldValue;
-    SLObject    *relation;
-    
-    // retrieve the old (current) value and convert from NSNull back to nil if needed
-    
-    oldValue = [self dictionaryValueForKey:key];
-    if ((id)oldValue == [NSNull null])
-        oldValue = nil;
-    
-    // maintain the reference lists
-    
-    if ([SLObject isRelation:oldValue]) {
-        relation = (SLObject *)oldValue;
-        [relation.references removeObject:self];
-    }
-    
-    if ([SLObject isRelation:value]) {
-        relation = (SLObject *)value;
-        [relation.references addObject:self];
-    }
-    
-    // convert nil values to [NSNull null];
-    
-    if (!value)
-        value = [NSNull null];
-
-    self.values[key] = value;
-}
-
-
-// utility method to convert a database value to a dictionary value.
-// PFObject * are converted to SLObject *.
-// [NSNull null] is converted to nil
-// All other object types/values are left untouched.
-
-- (id)databaseToDictionaryValue:(id)value
-{
-    PFObject    *dbObject;
-    
-    if (value == [NSNull null])
-        return nil;
-    
-    // convert if attribute is a relation (class of PFObject)
-    
-    if ([SLObject isDBRelation:value]) {
-        dbObject = (PFObject *)value;
-        
-        // this returns nil if the object has an unknown objectID. this may
-        // happen if a reference to a deleted object is left dangling in the database
-        // (see discussion under resolveDanglingReferencesToDeletedObjects:local:)
-        
-        return [self.registry objectForID:dbObject.objectId];
-    }
-    
-    return value;
-}
-
-
-// utility method to convert a dictionary value to a database value.
-// SLObject * are converted to PFObject *.
-// nil values are converted to [NSNull null]
-// All other object types/values are left untouched.
-
-- (id)dictionaryToDatabaseValue:(id)value
-{
-    SLObject        *relation;
-    
-    // convert if attribute is a relation (class of SLObject)
-    // a reference to the same database object is created
-    
-    if ([SLObject isRelation:value]) {
-        relation = (SLObject *)value;
-        
-        // lazily create a database object for the relation
-        
-        if (!relation.databaseObject) {
-            assert(relation.objectID);
-            relation.databaseObject = [PFObject objectWithoutDataWithClassName:relation.className objectId:relation.objectID];
-            assert(relation.databaseObject);
-        }
-        return relation.databaseObject;
-    }
-    
-    if (!value)
-        return [NSNull null];
-
-    return value;;
-}
-
-
-// utility method to check whether a given attribute is a database relation
-
-+ (BOOL)isDBRelation:(id)attribute
-{
-    return (attribute && [attribute isKindOfClass:[PFObject class]]);
-}
-
-
-// utility method to check whether a given attribute is a memory relation
-
-+ (BOOL)isRelation:(id)attribute
-{
-    return (attribute && [attribute isKindOfClass:[SLObject class]]);
-}
-
-
-// objectFromExistingWithClassName:objectID: instantiates an existing object, but leaves its value directory empty.
-// this is the first part of remote object instantiation
-
-+ (SLObject *)objectFromExistingWithClassName:(NSString *)className objectID:(NSString *)objectID
-{
-    id                  subclass;
-    SLObjectRegistry    *registry;
-    SLObject            *instance;
-    
-    registry = [SLObjectRegistry sharedObjectRegistry];
-    
-    subclass = [registry classForRegisteredClassWithName:className];
-    if (!subclass)
-        subclass = [SLObject class];
-    instance = [[subclass alloc] init];
-    
-    // add the object to the registry
-    
-    instance.objectID = objectID;
-    instance.className = className;
-    instance.createdRemotely = TRUE;
-    
-    // add this instance to the registry
-    
-    [registry addObject:instance];
-    
-    return instance;
-}
-
-
-// populatWithDictionary: assign a value directory to an object. this is the second part of remote object instantiation
-
-- (void)populateWithDictionary:(NSDictionary *)databaseDictionary
-{
-    // instantiate the dictionary value
-    
-    self.values = [NSMutableDictionary dictionary];
-    
-    // iterate over the database values and populate the dictionary
-    
-    for (NSString *key in databaseDictionary) {
-        id value;
-        
-        value = [self databaseToDictionaryValue:databaseDictionary[key]];
-        [self setDictionaryValue:value forKey:key];
-    }
-    
 }
 
 @end

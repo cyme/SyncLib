@@ -5,10 +5,12 @@
 //
 
 #import "SLObjectRegistry.h"
-#import "SLClientManager.h"
-#import "SLObject_Private.h"
+#import "SLClientManager-Internal.h"
+#import "SLObject-Internal.h"
 #import "SLOperationManager.h"
 #import "SLChange.h"
+#import "SLTransaction-Internal.h"
+#import "SLTransactionManager.h"
 #import "SLObjectObserving.h"
 #import "BlockCondition.h"
 #import <Parse/Parse.h>
@@ -21,15 +23,14 @@ static NSString * const kPFObjectLastModifiedKey = @"updatedAt";
 
 static NSSet *kPFObjectSystemKeys;
 
-static NSString * const kSLObjectRegistryObjectsName = @"SLORObjects";
-static NSString * const kSLObjectRegistryLocallyModifiedObjectsName = @"SLORLocallyModifiedObject";
-static NSString * const kSLObjectRegistryLocallyCreatedObjectsName = @"SLORLocallyCreatedObjects";
-static NSString * const kSLObjectRegistryLocallyDeletedObjectsName = @"SLORLocallyDeletedObjects";
-static NSString * const kSLObjectRegistryLastSyncName = @"SLORLastSync";
+static NSString * const kSLObjectRegistryClientMgrKey = @"clientMgr";
+static NSString * const kSLObjectRegistryTransactionMgrKey = @"transactionMgr";
+static NSString * const kSLObjectRegistryLastSyncKey = @"lastSync";
+static NSString * const kSLObjectRegistryObjectsKey = @"objects";
 
 static NSString * const kSLCacheFileName = @"SLCache";
 
-static NSTimeInterval const kSLSyncSoonTimeInterval = 10.0;
+static NSTimeInterval const kSLDefaultSyncLag = 10.0;
 static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 
 
@@ -38,43 +39,52 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 
 @interface SLObjectRegistry ()
 
-@property (weak, nonatomic) SLClientManager *clientMgr;
+@property (nonatomic) SLClientManager       *clientMgr;
 @property (nonatomic) SLOperationManager    *operationMgr;
+@property (nonatomic) SLTransactionManager  *transactionMgr;
 
 @property (nonatomic) NSTimeInterval        syncInterval;
 @property (nonatomic) NSDate                *lastSync;
 @property (nonatomic) NSTimer               *timer;
 
 @property (nonatomic) NSMutableSet          *objects;
-@property (nonatomic) NSMapTable            *objectIDMap;
+@property (nonatomic) NSMutableDictionary   *objectIDMap;
 
 @property (nonatomic) NSMutableSet          *locallyModifiedObjects;
-@property (nonatomic) NSMapTable            *locallyModifiedObjectIDMap;
+@property (nonatomic) NSMutableDictionary   *locallyModifiedObjectIDMap;
 @property (nonatomic) NSMutableSet          *locallyCreatedObjects;
 @property (nonatomic) NSMutableSet          *locallyDeletedObjects;
-@property (nonatomic) NSMapTable            *locallyDeletedObjectIDMap;
+@property (nonatomic) NSMutableDictionary   *locallyDeletedObjectIDMap;
 
-@property (nonatomic) NSMutableSet          *remotelyModifiedObjects;
-@property (nonatomic) NSMutableSet          *remotelyCreatedObjects;
-@property (nonatomic) NSMutableSet          *remotelyDeletedObjects;
+@property (nonatomic) NSMapTable            *uncommittedValues;
 
 @property (nonatomic) NSMutableDictionary   *registeredClasses;
 @property (nonatomic) NSMutableDictionary   *observers;
+@property (nonatomic) NSMapTable            *observerNotified;
+@property NSInteger                         notificationNestingLevel;
 
 @property (nonatomic) NSMutableDictionary   *cloudPersistedProperties;
 @property (nonatomic) NSMutableDictionary   *localPersistedProperties;
 @property (nonatomic) NSMutableDictionary   *localTransientProperties;
 
-// properties used by syncAllInBackground method
+// properties used by -syncAllInBackgroundWithBlock:
 
 @property (nonatomic) NSMutableArray        *downloadedObjects;
-@property (nonatomic) NSMapTable            *downloadedObjectIDMap;
+@property (nonatomic) NSMutableDictionary   *downloadedObjectIDMap;
+
+@property (nonatomic) NSMutableSet          *remotelyModifiedObjects;
+@property (nonatomic) NSMutableSet          *remotelyCreatedObjects;
+@property (nonatomic) NSMutableSet          *remotelyDeletedObjects;
+
+@property (nonatomic) NSMutableOrderedSet   *remoteChanges;
+@property (nonatomic) NSArray               *voidedChanges;
+@property (nonatomic) NSArray               *confirmedChanges;
 
 @property (nonatomic) NSMutableSet          *savedLocallyModifiedObjects;
-@property (nonatomic) NSMapTable            *savedLocallyModifiedObjectIDMap;
+@property (nonatomic) NSMutableDictionary   *savedLocallyModifiedObjectIDMap;
 @property (nonatomic) NSMutableSet          *savedLocallyCreatedObjects;
 @property (nonatomic) NSMutableSet          *savedLocallyDeletedObjects;
-@property (nonatomic) NSMapTable            *savedLocallyDeletedObjectIDMap;
+@property (nonatomic) NSMutableDictionary   *savedLocallyDeletedObjectIDMap;
 
 
 // factory methods
@@ -88,15 +98,15 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 - (void)identifyRemotelyDeletedObjects;
 - (void)identifyRemotelyCreatedObjects;
 - (void)identifyRemotelyModifiedObjects;
+- (void)finalizeUncommittedChanges;
 - (void)resolveDanglingReferencesToDeletedObjects:(NSSet *)deletedObjects local:(BOOL)local;
 - (void)resolveDanglingReferences;
 - (void)updateDatabaseObjectCache;
-- (NSDictionary *)orderClassesByAncestry:(NSArray *)objects;
-- (void)performOnAllClasses:(NSDictionary *)dictionary inOrder:(BOOL)order block:(void(^)(NSArray *observers, Class subclass, NSArray *objectArrays)) block;
-- (void)notifyRemoteChanges;
+- (NSArray *)orderObjectsByAncestry:(NSSet *)objects increasing:(BOOL)increasing;
+- (void)notifyChanges;
 - (void)mergeChanges;
 - (BOOL)isDownloadedGraphComplete;
-- (void) downloadObjectsInBackgroundChangedSince:(NSDate*)since
+- (void)downloadObjectsInBackgroundChangedSince:(NSDate*)since
                                    withClassName:(NSString *)className
                                       completion:(void(^)(NSArray *, NSError *))continuation;
 - (void)downloadObjectsInBackgroundChangedSince:(NSDate *)since
@@ -110,11 +120,9 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 @end
 
 
-#pragma mark - Public interface implementation
-
 @implementation SLObjectRegistry
 
-#pragma mark Public methods
+#pragma mark - Public methods
 
 // return the shared instance of the global registry
 
@@ -189,48 +197,36 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 - (void)addObserver:(id<SLObjectObserving>)observer forClass:(Class)subclass
 {
     NSString        *className;
-    NSMutableSet    *fetchedObjects, *createdObjects;
+    NSMutableSet    *createdObjects;
     
     className = [subclass className];
     if (!self.registeredClasses[className])
         return;
     [self.observers[className] addObject:observer];
     
-    // retroactively invoke didCreateObject: on the objects that have already been fetched from the cache and
-    // created locally and remotely. Past deletions do not need to be notified.
+    // retroactively notify of the creation the objects that have already been fetched from the cache
+    // and created either locally or remotely. Past deletions do not need to be notified.
     
-    fetchedObjects = [NSMutableSet set];
     createdObjects = [NSMutableSet set];
     for(SLObject *object in self.objects)
         if (!object.deleted && (self.registeredClasses[object.className] == subclass)) {
-            if (object.createdFromCache)
-                [fetchedObjects addObject:object];
-            if (object.createdRemotely)
                 [createdObjects addObject:object];
-
-            }
+        }
     
-    if (([fetchedObjects count] != 0) || ([createdObjects count] != 0)) {
+    if ([createdObjects count] > 0) {
         
         // notify the beginning of change notifications
         
-        if ([observer respondsToSelector:@selector(willChangeObjectsForClass:)])
-            [observer willChangeObjectsForClass:subclass];
+        [self notifyObserversWillChangeObjects:@[observer]];
      
         // notify of object creations
-        // no need to handle reentrant object operations here because this observer only is notified
-        
-        if ([observer respondsToSelector:@selector(didCreateObject:remotely:)]) {
-            for(SLObject *object in fetchedObjects)
-                [observer didCreateObject:object remotely:FALSE];
-            for(SLObject *object in createdObjects)
-                [observer didCreateObject:object remotely:object.createdRemotely];
-        }
-       
+    
+        for(SLObject *object in createdObjects)
+            [self notifyObserver:observer didCreateObject:object remote:FALSE];
+
         // notify the end of change notifications
         
-        if ([observer respondsToSelector:@selector(didChangeObjectsForClass:)])
-            [observer didChangeObjectsForClass:subclass];
+        [self notifyObserversDidChangeObjects:@[observer]];
     }
 }
 
@@ -290,7 +286,7 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 
             // notify the client of remote changes
 
-            [weakSelf notifyRemoteChanges];
+            [weakSelf notifyChanges];
 
             // save all local changes
 
@@ -327,7 +323,6 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     }];
 }
 
-
 // update the local cache
 
 - (void)saveToDisk
@@ -342,9 +337,10 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     url = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] lastObject];
     path = [NSString pathWithComponents:@[[url path], @"/", kSLCacheFileName]];
     
-    rootObject = @{@"clientMgr": [self.clientMgr archiveToDictionary],
-                   @"lastSync": self.lastSync,
-                   @"objects" : self.objects};
+    rootObject = @{kSLObjectRegistryClientMgrKey: self.clientMgr,
+                   kSLObjectRegistryTransactionMgrKey: self.transactionMgr,
+                   kSLObjectRegistryLastSyncKey: self.lastSync,
+                   kSLObjectRegistryObjectsKey : self.objects};
     
     [NSKeyedArchiver archiveRootObject:rootObject toFile:path];
 }
@@ -371,17 +367,17 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     if (rootObject) {
         
         NSMutableSet            *notifiedObjects;
-        NSDictionary            *orderedClassesDictionary;
+        NSArray                 *orderedObjects;
+        NSMutableOrderedSet     *notifiedObservers;
         
         // that was successful
-        
-        [self.clientMgr unarchiveFromDictionary:rootObject[@"clientMgr"]];
-        
         // update the rest of the object registry structures
         
-        self.objects = rootObject[@"objects"];
+        self.clientMgr = rootObject[kSLObjectRegistryClientMgrKey];
+        self.transactionMgr = rootObject[kSLObjectRegistryTransactionMgrKey];
+        self.objects = rootObject[kSLObjectRegistryObjectsKey];
         assert(self.objects);
-        self.lastSync = rootObject[@"lastSync"];
+        self.lastSync = rootObject[kSLObjectRegistryLastSyncKey];
         
         for(SLObject *object in self.objects) {
             
@@ -408,53 +404,35 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
         for(SLObject *object in self.locallyDeletedObjects)
             [self.locallyDeletedObjectIDMap setObject:object forKey:object.objectID];
         
-        // invoke didCreateObject: on all instances of registered subclasses, one subclass at a time
+        // notify of object creations
         
         notifiedObjects = [NSMutableSet set];
         for(SLObject *object in self.objects)
             if (!object.deleted && self.registeredClasses[object.className])
                 [notifiedObjects addObject:object];
         
-        orderedClassesDictionary = [self orderClassesByAncestry:@[notifiedObjects]];
+        notifiedObservers = [NSMutableOrderedSet orderedSet];
+        for(SLObject *object in notifiedObjects) {
+            NSArray         *observers;
+            
+            observers = self.observers[object.className];
+            [notifiedObservers addObjectsFromArray:observers];
+        }
+
+        orderedObjects = [self orderObjectsByAncestry:notifiedObjects increasing:TRUE];
         
         // notify the beginning of change notifications
         
-        [self performOnAllClasses:orderedClassesDictionary inOrder:TRUE block:^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-            for(NSObject<SLObjectObserving> *observer in observers)
-                if ([observer respondsToSelector:@selector(willChangeObjectsForClass:)])
-                    [observer willChangeObjectsForClass:subclass];
-            
-        }];
+        [self notifyObserversWillChangeObjects:[notifiedObservers array]];
         
         // notify of object creations
         
-        [self performOnAllClasses:orderedClassesDictionary inOrder:TRUE block:^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-            for(SLObject *object in objectArrays[0]) {
-                for(NSObject<SLObjectObserving> *observer in observers) {
-                    
-                    // if the object has been deleted by an observer, no further notification to send
-                    if (!object.operable)
-                        break;
-                    
-                    // keep track of the last observer notified of the object creation, so that reentrant
-                    // object operations (e.g. setting an attribute) do not reveal the object to observers
-                    // that have not been notified of its creation yet
-                    
-                    object.lastObserverNotified = observer;
-                    if ([observer respondsToSelector:@selector(didCreateObject:remotely:)])
-                        [observer didCreateObject:object remotely:FALSE];
-                }
-                object.lastObserverNotified = nil;
-            }
-        }];
+        for(SLObject *object in orderedObjects)
+            [self notifyObserversDidCreateObject:object remote:FALSE];
+                
+        // notify the end of change notifications
         
-        // notify the end of change notifications (in reverse order of registration)
-        
-        [self performOnAllClasses:orderedClassesDictionary inOrder:TRUE block:^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-            for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator])
-                if ([observer respondsToSelector:@selector(didChangeObjectsForClass:)])
-                    [observer didChangeObjectsForClass:subclass];
-        }];
+        [self notifyObserversDidChangeObjects:[notifiedObservers array]];
     }
 }
 
@@ -487,7 +465,7 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     
     if (self.timer)
         [self.timer invalidate];
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:kSLSyncSoonTimeInterval
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:self.syncLag
                                                 target:self
                                                 selector:@selector(timerFireMethod:)
                                                 userInfo:nil
@@ -495,7 +473,7 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 }
 
 
-- (void)addObject:(SLObject *)object
+- (void)insertObject:(SLObject *)object
 {
     // insert the object in the registry
     
@@ -515,43 +493,6 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     }
 }
 
-
-- (void)removeObject:(SLObject *)object
-{
-    if (object.objectID) {
-        
-        // the object has been synced with the database
-        // we discard any pending changes to the object and remove it from the locally modified list if it was there
-        
-        [self.locallyModifiedObjects removeObject:self];
-        [self.locallyModifiedObjectIDMap removeObjectForKey:object.objectID];
-        
-        // we add the object to the locally deleted list
-        
-        [self.locallyDeletedObjects addObject:self];
-        [self.locallyDeletedObjectIDMap setObject:self forKey:object.objectID];
-        
-        // schedule a sync
-        // the deletion will be committed to the cloud on the next sync
-        // once the sync has completed, the object will be removed from the registry.
-        // at that point the registry will hold no more strong reference to the object.
-        
-        [self scheduleSync];
-        
-    } else {
-        
-        // the object is new and hasn't been synced to the database yet
-        // we discard it from the locally created list
-        
-        [self.locallyCreatedObjects removeObject:self];
-        
-        // we also discard it from the object registry. this is the last strong reference
-        // the registry holds to the object.
-        
-        [self.objects removeObject:self];
-    }
-}
-
 - (void)removeAllObjects
 {
     [self.objects removeAllObjects];
@@ -566,6 +507,45 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     [self.remotelyDeletedObjects removeAllObjects];
 }
 
+- (void)markObjectDeleted:(SLObject *)object
+{
+    // forget any uncommitted values
+    
+    [self.uncommittedValues removeObjectForKey:object];
+    
+    if (object.objectID) {
+        
+        // the object has been synced with the database
+        // we discard any pending changes to the object and remove it from the locally modified list if it was there
+        
+        [self.locallyModifiedObjects removeObject:object];
+        [self.locallyModifiedObjectIDMap removeObjectForKey:object.objectID];
+        
+        // we add the object to the locally deleted list
+        
+        [self.locallyDeletedObjects addObject:object];
+        [self.locallyDeletedObjectIDMap setObject:object forKey:object.objectID];
+        
+        // if syncing mode is enable, we schedule a sync
+        // the deletion will be committed to the cloud on the next sync
+        // once the sync has completed, the object will be removed from the registry.
+        // at that point the registry will hold no more strong reference to the object.
+        
+        [self scheduleSync];
+        
+    } else {
+        
+        // the object is new and hasn't been synced to the database yet
+        // we discard it from the locally created list
+        
+        [self.locallyCreatedObjects removeObject:object];
+        
+        // we also discard it from the object registry. this is the last strong reference
+        // the registry holds to the object.
+        
+        [self.objects removeObject:object];
+    }
+}
 
 - (void)markObjectModified:(SLObject *)object local:(BOOL)local
 {
@@ -584,6 +564,49 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
         [self.locallyModifiedObjectIDMap removeObjectForKey:object.objectID];
     } else
         [self.remotelyModifiedObjects removeObject:object];
+}
+
+- (void)addRemoteChange:(SLChange *)change
+{
+    assert(!change.local && !change.issuingTransaction);
+    [self.remoteChanges addObject:change];
+}
+
+- (void)removeRemoteChange:(SLChange *)change
+{
+    assert([self.remoteChanges containsObject:change]);
+    [self.remoteChanges removeObject:change];
+}
+
+- (id)uncommittedValueForObject:(SLObject *)object key:(NSString *)key
+{
+    NSDictionary    *uncommittedValues;
+    
+    uncommittedValues = [self.uncommittedValues objectForKey:object];
+    return uncommittedValues[key];
+}
+
+- (void)setUncommittedValue:(id)value forObject:(SLObject *)object key:(NSString *)key
+{
+    NSMutableDictionary     *uncommittedValues;
+    
+    uncommittedValues = [self.uncommittedValues objectForKey:object];
+    if (!uncommittedValues) {
+        uncommittedValues = [NSMutableDictionary dictionary];
+        assert(uncommittedValues);
+        [self.uncommittedValues setObject:uncommittedValues forKey:object];
+    }
+    uncommittedValues[key] = value;
+}
+
+- (void)clearUncommittedValues
+{
+    [self.uncommittedValues removeAllObjects];
+}
+
+- (BOOL)inNotification
+{
+    return (self.notificationNestingLevel > 0);
 }
 
 - (NSArray *)classNames
@@ -621,7 +644,255 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     return self.localTransientProperties[className];
 }
 
-#pragma mark - Private interface implementation
+// notify the beginning of change notifications
+
+- (void)notifyObserversWillChangeObjects:(NSArray *)observers
+{
+    for(NSObject<SLObjectObserving> *observer in observers) {
+        
+        if ([observer respondsToSelector:@selector(willChangeObjects)]) {
+            
+            NSInteger       nestingLevel;
+            
+            // handle the following case of reentrant notifications: if an (local or remote) object creation
+            // notification observer modifies one of the attributes of the created object or deletes the
+            // created object, the (local) modification or deletion cannot be notified to observers that have
+            // not been informed of the object creation yet. see comment in
+            // [SLObject objectFromExistingWithClassName:objectID:] and in [SLObjectRegistry notifyChanges]
+            
+            nestingLevel = [[self.observerNotified objectForKey:observer] integerValue];
+            nestingLevel++;
+            [self.observerNotified setObject:@(nestingLevel) forKey:observer];
+            if (nestingLevel > 1)
+                continue;
+            
+            self.notificationNestingLevel++;
+            
+            [observer willChangeObjects];
+            
+            self.notificationNestingLevel--;
+        }
+    }
+}
+
+// notify the end of change notifications
+
+- (void)notifyObserversDidChangeObjects:(NSArray *)observers
+{
+    for(NSObject<SLObjectObserving> *observer in observers) {
+        
+        if ([observer respondsToSelector:@selector(didChangeObjects)]) {
+            
+            NSInteger       nestingLevel;
+            
+            // handle the following case of reentrant notifications: if an (local or remote) object creation
+            // notification observer modifies one of the attributes of the created object or deletes the
+            // created object, the (local) modification or deletion cannot be notified to observers that have
+            // not been informed of the object creation yet. see comment in
+            // [SLObject objectFromExistingWithClassName:objectID:] and in [SLObjectRegistry notifyChanges]
+            
+            nestingLevel = [[self.observerNotified objectForKey:observer] integerValue];
+            assert(nestingLevel > 0);
+            nestingLevel--;
+            if (nestingLevel > 0) {
+                [self.observerNotified setObject:@(nestingLevel) forKey:observer];
+                continue;
+            }
+            [self.observerNotified removeObjectForKey:observer];
+            
+            self.notificationNestingLevel++;
+
+            [observer didChangeObjects];
+            
+            self.notificationNestingLevel--;
+        }
+    }
+}
+
+// notify of the object deletion (observers notified in reverse order of registration)
+
+- (void)notifyObserversWillDeleteObject:(SLObject *)object remote:(BOOL)remote
+{
+    NSArray     *observers;
+    BOOL        found;
+    
+    observers = self.observers[object.className];
+    found = FALSE;
+    for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
+        
+        // handle the following case of reentrant notifications: if an (local or remote) object creation
+        // notification observer modifies one of the attributes of the created object or deletes the
+        // created object, the (local) modification or deletion cannot be notified to observers that have
+        // not been informed of the object creation yet. see comment in
+        // [SLObject objectFromExistingWithClassName:objectID:] and in [SLObjectRegistry notifyChanges]
+        
+        if (!remote && !found && object.lastObserverNotified && (observer != object.lastObserverNotified))
+            continue;
+        found = TRUE;
+        
+        // the object has already marked for deletion, so it can be deleted from within the notification
+        // handler. therefore no need to check for that situation.
+        
+        if ([observer respondsToSelector:@selector(willDeleteObject:remotely:)]) {
+            self.notificationNestingLevel++;
+            [observer willDeleteObject:object remotely:remote];
+            self.notificationNestingLevel--;
+        }
+    }
+}
+
+// notify of the object creation (observers notified in order of registration)
+
+- (void)notifyObserversDidCreateObject:(SLObject *)object remote:(BOOL)remote
+{
+    for(id<SLObjectObserving> observer in self.observers[object.className]) {
+        
+        // if the object has been deleted by an observer, no further notification to send
+        
+        if (!object.operable)
+            break;
+        
+        // keep track of the last observer notified of the object creation, so that reentrant
+        // object operations (i.e. setting an attribute or deleting the object inside the creation
+        // notification handler) do not reveal the object to observers that have not been notified
+        // of its creation yet
+        
+        object.lastObserverNotified = observer;
+        
+        if ([observer respondsToSelector:@selector(didCreateObject:remotely:)]) {
+            self.notificationNestingLevel++;
+            [observer didCreateObject:object remotely:remote];
+            self.notificationNestingLevel--;
+        }
+    }
+    object.lastObserverNotified = nil;
+}
+
+- (void)notifyObserver:(id<SLObjectObserving>)observer didCreateObject:(SLObject *)object remote:(BOOL)remote
+{
+    if ([observer respondsToSelector:@selector(didCreateObject:remotely:)]) {
+        self.notificationNestingLevel++;
+        [observer didCreateObject:object remotely:remote];
+        self.notificationNestingLevel--;
+    }
+}
+
+- (void)notifyObserversWillChangeObjectValue:(SLObject *)object forKey:(NSString *)key oldValue:(id)oldValue newValue:(id)newValue remote:(BOOL)remote
+{
+    NSArray     *observers;
+    BOOL        found;
+    
+    // if the value hasn't changed, we don't need to notify the observers
+    
+    if (oldValue == newValue)
+        return;
+    
+    observers = self.observers[object.className];
+    found = FALSE;
+    for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
+        
+        // handle the following case of reentrant notifications: if an object creation notification observer
+        // modifies one of the attributes of the created object or deletes the created object, the modification
+        // or deletion cannot be notified to observers that have not been informed of the object creation yet.
+        // see comment in [SLObject objectFromExistingWithClassName:objectID:] and in
+        // [SLObjectRegistry notifyChanges]
+        
+        if (!remote && !found && object.lastObserverNotified && (observer != object.lastObserverNotified))
+            continue;
+        found = TRUE;
+        
+        // if the object has been deleted by an observer, no further notification to send
+        
+        if (!object.operable)
+            break;
+        
+        if ([observer respondsToSelector:@selector(willChangeObjectValue:forKey:oldValue:newValue:remotely:)]) {
+            self.notificationNestingLevel++;
+            [observer willChangeObjectValue:object forKey:key oldValue:oldValue newValue:newValue remotely:remote];
+            self.notificationNestingLevel--;
+        }
+    }
+}
+
+- (void)notifyObserversDidChangeObjectValue:(SLObject *)object forKey:(NSString *)key oldValue:(id)oldValue newValue:(id)newValue remote:(BOOL)remote
+{
+    // if the value hasn't changed, we don't need to notify the observers
+    
+    if (oldValue == newValue)
+        return;
+    
+    for(NSObject<SLObjectObserving> *observer in self.observers[object.className]) {
+        
+        // if the object has been deleted by an observer, no further notification to send
+        
+        if (!object.operable)
+            break;
+        
+        if ([observer respondsToSelector:@selector(didChangeObjectValue:forKey:oldValue:newValue:remotely:)]) {
+            self.notificationNestingLevel++;
+            [observer didChangeObjectValue:object forKey:key oldValue:oldValue newValue:newValue remotely:remote];
+            self.notificationNestingLevel--;
+        }
+        
+        // handle the following case of reentrant notifications: if an object creation notification observer
+        // modifies one of the attributes of the created object or deletes the created object, the modification
+        // or deletion cannot be notified to observers that have not been informed of the object creation yet.
+        // see comment in [SLObject objectFromExistingWithClassName:objectID:] and in
+        // [SLObjectRegistry notifyChanges]
+        
+        if (observer == object.lastObserverNotified)
+            break;
+    }
+}
+
+- (void)notifyObserversWillResetObjectValue:(SLObject *)object forKey:(NSString *)key oldValue:(id)oldValue newValue:(id)newValue
+{
+    NSArray     *observers;
+    
+    // if the value hasn't changed, we don't need to notify the observers
+    
+    if (oldValue == newValue)
+        return;
+    
+    observers = self.observers[object.className];
+    for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
+        
+        // if the object has been deleted by an observer, no further notification to send
+        
+        if (!object.operable)
+            break;
+        
+        if ([observer respondsToSelector:@selector(willResetObjectValue:forKey:oldValue:newValue:)]) {
+            self.notificationNestingLevel++;
+            [observer willResetObjectValue:object forKey:key oldValue:oldValue newValue:newValue];
+            self.notificationNestingLevel--;
+        }
+    }
+}
+
+- (void)notifyObserversDidResetObjectValue:(SLObject *)object forKey:(NSString *)key oldValue:(id)oldValue newValue:(id)newValue
+{
+    // if the value hasn't changed, we don't need to notify the observers
+    
+    if (oldValue == newValue)
+        return;
+    
+    for(NSObject<SLObjectObserving> *observer in self.observers[object.className]) {
+        
+        // if the object has been deleted by an observer, no further notification to send
+        
+        if (!object.operable)
+            break;
+        
+        if ([observer respondsToSelector:@selector(didResetObjectValue:forKey:oldValue:newValue:)]) {
+            self.notificationNestingLevel++;
+            [observer didResetObjectValue:object forKey:key oldValue:oldValue newValue:newValue];
+            self.notificationNestingLevel--;
+        }
+    }
+}
+
+#pragma mark - Private methods
 
 #pragma mark Initializers
 
@@ -647,21 +918,21 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     _objects = [NSMutableSet set];
     if (!_objects)
         return nil;
-    _objectIDMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory valueOptions:NSMapTableWeakMemory];
+    _objectIDMap = [NSMutableDictionary dictionary];
     if (!_objectIDMap)
         return nil;
     
     _downloadedObjects = [NSMutableArray array];
     if (!_downloadedObjects)
         return nil;
-    _downloadedObjectIDMap = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory valueOptions:NSMapTableWeakMemory];
+    _downloadedObjectIDMap = [NSMutableDictionary dictionary];
     if (!_downloadedObjectIDMap)
         return nil;
 
     _locallyModifiedObjects = [NSMutableSet set];
     if (!_locallyModifiedObjects)
         return nil;
-    _locallyModifiedObjectIDMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory valueOptions:NSMapTableWeakMemory];
+    _locallyModifiedObjectIDMap = [NSMutableDictionary dictionary];
     if (!_locallyModifiedObjectIDMap)
         return nil;
     
@@ -672,10 +943,14 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     _locallyDeletedObjects = [NSMutableSet set];
     if (!_locallyDeletedObjects)
         return nil;
-    _locallyDeletedObjectIDMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory valueOptions:NSMapTableWeakMemory];
+    _locallyDeletedObjectIDMap = [NSMutableDictionary dictionary];
     if (!_locallyDeletedObjectIDMap)
         return nil;
 
+    _uncommittedValues = [NSMapTable strongToStrongObjectsMapTable];
+    if (!_uncommittedValues)
+        return nil;
+    
     _savedLocallyModifiedObjects = nil;
     _savedLocallyModifiedObjectIDMap = nil;
     _savedLocallyCreatedObjects = nil;
@@ -691,6 +966,12 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     _remotelyDeletedObjects = [NSMutableSet set];
     if (!_remotelyDeletedObjects)
         return nil;
+    
+    _remoteChanges = [NSMutableOrderedSet orderedSet];
+    if (!_remoteChanges)
+        return nil;
+    _voidedChanges = nil;
+    _confirmedChanges = nil;
 
     _registeredClasses = [NSMutableDictionary dictionary];
     if (!_registeredClasses)
@@ -699,7 +980,13 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     _observers = [NSMutableDictionary dictionary];
     if (!_observers)
         return nil;
+    
+    _notificationNestingLevel = 0;
 
+    _observerNotified = [NSMapTable strongToStrongObjectsMapTable];
+    if (!_observerNotified)
+        return nil;
+    
     _cloudPersistedProperties = [NSMutableDictionary dictionary];
     if (!_cloudPersistedProperties)
         return nil;
@@ -716,12 +1003,15 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
     
     _clientMgr = [SLClientManager sharedClientManager];
     
+    _transactionMgr = [SLTransactionManager sharedTransactionManager];
+    
     _lastSync = [NSDate distantPast];
     if (!_lastSync)
         return nil;
     _timer = nil;
     _syncInterval = kSLDefaultSyncInterval;
-
+    _syncLag = kSLDefaultSyncLag;
+    
     return self;
 }
 
@@ -745,35 +1035,22 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
             [self.objectIDMap removeObjectForKey:object.objectID];
         }
 
-    // remove the remotely deleted objects from the registry and mark them deleted
-    // so that they cannot be operated on
+    // remove the remotely deleted objects from the registry
     // this triggers their eventual disposal
     
-    for(SLObject *object in self.remotelyDeletedObjects) {
-        object.deleted = TRUE;
-        [self.objects removeObject:object];
-        [self.objectIDMap removeObjectForKey:object.objectID];
-    }
+    for(SLObject *object in self.remotelyDeletedObjects)
+        [object completeDeletion];
 
     if (error) {
         
-        // in case of error, the local changes need to be preserved so that they may be
-        // saved to the cloud or stored in the cache later.
+        // in case of error, the local changes need to be preserved so that they may
+        // be saved to the cloud or stored in the cache later.
         // remote changes don't need to be saved as they've been already processed
- 
-        for(SLObject *object in self.savedLocallyModifiedObjects) {
-            
-            for(NSString *key in object.savedLocalChanges) {
-                SLChange        *change;
-                
-                change = object.savedLocalChanges[key];
-                
-                // preserve the change if the value hasn't been changed since (by a notification handler)
-                
-                if (!object.localChanges[key])
-                    object.localChanges[key] = change;
-            }
-        }
+        // there can't be any confirmed transaction change, as we didn't have a successful
+        // server connection
+        
+        for(SLObject *object in self.savedLocallyModifiedObjects)
+            [object doneWithSavedLocalChanges:TRUE];
 
         [self.locallyModifiedObjects unionSet:self.savedLocallyModifiedObjects];
         [self.locallyDeletedObjects unionSet:self.savedLocallyDeletedObjects];
@@ -789,19 +1066,25 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
             [self.locallyDeletedObjectIDMap setObject:object forKey:key];
         }
 
-    }
+    } else {
     
-    // dispose of the saved local change dictionary for all locally modified objects
-    
-    for(SLObject *object in self.savedLocallyModifiedObjects) {
-        object.savedLocalChanges = nil;
+        // if no error, dispose of the saved local change dictionary for all locally
+        // modified objects
+        
+        for(SLObject *object in self.savedLocallyModifiedObjects)
+            [object doneWithSavedLocalChanges:FALSE];
     }
+
+    // remote changes, voided and confirmed changes can safely be forgotten now
+    
+    [self.remoteChanges removeAllObjects];
+    self.voidedChanges = nil;
+    self.confirmedChanges = nil;
 
     // dispose of the remote change dictionary for all remotely modified objects
 
-    for(SLObject *object in self.remotelyModifiedObjects) {
-        object.remoteChanges = nil;
-    }
+    for(SLObject *object in self.remotelyModifiedObjects)
+        [object removeAllRemoteChanges];
 
     self.savedLocallyModifiedObjects = nil;
     self.savedLocallyModifiedObjectIDMap = nil;
@@ -817,183 +1100,133 @@ static NSTimeInterval const kSLDefaultSyncInterval = 120.0;
 }
 
 
-// colorize is used to recursively explore the object graph and order subclasses, from children to parents
+// calculateDepth recursively explores the object graph and assign a depth level to each object reached
 
-static NSUInteger colorize(SLObject *object, NSUInteger index, NSMutableDictionary *classOrders)
+static NSUInteger calculateDepth(SLObject *object, NSUInteger depth, NSMutableArray *objectLevels)
 {
-    NSUInteger      maxIndex, thisIndex;
-    NSNumber        *classOrder;
+    NSUInteger      maxDepth, thisDepth;
+    NSMutableArray  *objects;
     
     // if the object has already been reached, return its color index
     
-    if (object.index != 0)
-        return object.index;
+    if (object.depth != 0)
+        return object.depth;
     
-    // asign a color index to this object
+    // asign a depth index to this object
     
-    object.index = index;
+    object.depth = depth;
     
-    // assign a color index to the subclass associated with this object, if this subclass hasn't been assigned one yet
+    // insert the object in the ordered list
     
-    classOrder = classOrders[object.className];
-    if (!classOrder) {
-        classOrders[object.className] = [NSNumber numberWithUnsignedInteger:index];
-    } else {
-        if ([classOrder unsignedIntegerValue] < index)
-            classOrders[object.className] = [NSNumber numberWithUnsignedInteger:index];
-    }
+    if ([objectLevels count] < depth) {
+        objects = [NSMutableArray array];
+        assert(objects);
+        [objectLevels addObject:objects];
+    } else
+        objects = objectLevels[depth-1];
+    [objects addObject:object];
     
     // recursively explore all relations of the object
     
-    maxIndex = index;
-    for(NSString *key in object.values) {
+    maxDepth = depth;
+    for(NSString *key in object.dictionaryKeys) {
         id          value;
         SLObject    *relation;
         
-        value = [object dictionaryValueForKey:key];
+        value = [object dictionaryValueForKey:key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE];
         if (!value || ![SLObject isRelation:value])
             continue;
         relation = (SLObject *)value;
-        thisIndex = colorize(relation, index+1, classOrders);
-        if (thisIndex > maxIndex)
-            maxIndex = thisIndex;
+        thisDepth = calculateDepth(relation, depth+1, objectLevels);
+        if (thisDepth > maxDepth)
+            maxDepth = thisDepth;
     }
     
-    // return the highest color index found
+    // return the maximum depth index reached
     
-    return maxIndex;
+    return maxDepth;
 }
 
 
-// uncolorize resets the object color so that colorize can be called again
+// reset resets the object color so that colorize can be called again
 
-static void uncolorize(SLObject *object)
+static void resetDepth(SLObject *object)
 {
     // return if this object has already been reset
     
-    if (object.index == 0)
+    if (object.depth == 0)
         return;
     
     // recursively reset this object and all its relations
     
-    object.index = 0;
-    for(NSString *key in object.values) {
+    object.depth = 0;
+    for(NSString *key in object.dictionaryKeys) {
         id          value;
         SLObject    *relation;
         
-        value = [object dictionaryValueForKey:key];
+        value = [object dictionaryValueForKey:key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE];
         if (!value || ![SLObject isRelation:value])
             continue;
         relation = (SLObject *)value;
-        uncolorize(relation);
+        resetDepth(relation);
     }
 }
 
 
-// orderClassesByAncestry takes a list of objects and builds a dictionary with the following:
-// - a list of ordered subclass names, (children subclass before its parents)
-// - a list of ordered object instances (ordered according to the subclass ordering above)
-// this method is used to determine the notification order provided an arbitrary list of objects with pending notifications
+// orderObjectsByAncestry takes a list of objects and returns another list of the same objects ordered by the
+// child-parent relationship. Object A is ordered before Object B if there is a relation path can be found from B
+// to A but not from A to B. If a path exists in both direction, A and B are not ordered and may appear in any
+// order in the list returned. If the parameter increasing is set to false, the list returned is ordered in the
+// reverse order
 
-- (NSDictionary *)orderClassesByAncestry:(NSArray *)sets
+- (NSArray *)orderObjectsByAncestry:(NSSet *)objects increasing:(BOOL)increasing
 {
-    NSUInteger              maxIndex, thisIndex;
-    NSMutableDictionary     *classOrders;
-    NSDictionary            *orderedClassDictionary;
+    NSMutableArray          *objectLevels;
+    NSMutableArray          *orderedObjects;
+    NSEnumerator            *enumerator;
     
-    // initialize the dictionary with empty structures
+    // recursively explore the object graph
     
-    maxIndex = 1;
-    orderedClassDictionary = @{ @"classNames" : [NSMutableArray array], @"instances" : [NSMutableDictionary dictionary]};
-    classOrders = [NSMutableDictionary dictionary];
-    
-    // recursively colorize the object graph
-    
-    for(NSSet *set in sets)
-        for(SLObject *object in set) {
-            thisIndex = colorize(object, 1, classOrders);
-            if (thisIndex > maxIndex)
-                maxIndex = thisIndex;
-            uncolorize(object);
-        }
-    
-    // build the ordered list of object instances and subclasses based on subclass indexes
-    
-    for(NSUInteger i=maxIndex; i!=0; i--) {
-        for(NSString *className in classOrders) {
-            NSNumber    *classOrder;
-            
-            classOrder = classOrders[className];
-            if ([classOrder integerValue] == i) {
-                
-                NSMutableArray *instanceArray;
-                
-                [orderedClassDictionary[@"classNames"] addObject:className];
-                instanceArray = [NSMutableArray array];
-                [orderedClassDictionary[@"instances"] addObject:instanceArray forKey:className];
-                for(NSSet *set in sets) {
-                    NSMutableArray  *instances;
-                    
-                    instances = [NSMutableArray array];
-                    [instanceArray addObject:instances];
-                    for(SLObject *object in set)
-                        if ([object.className isEqualToString:className])
-                            [instances addObject:object];
-                }
-            }
-        }
-    }
-    return orderedClassDictionary;
-}
+    objectLevels = [NSMutableArray array];
+    assert(objectLevels);
 
+    for(SLObject *object in objects)
+        calculateDepth(object, 1, objectLevels);
 
-// performOnAllClasses: is a utility method to perform a block on an ordered list of objects in a dictionary
-// following the format returned by orderClassesByAncestry:
-
-- (void)performOnAllClasses:(NSDictionary *)dictionary
-                    inOrder:(BOOL)inOrder
-                      block:(void(^)(NSArray *observers, Class subclass, NSArray *objectArrays))block
-{
-    NSArray             *classNames;
-    NSEnumerator        *enumerator;
-
-    classNames = dictionary[@"classNames"];
-    if (inOrder)
-        enumerator = [classNames objectEnumerator];
+    for(SLObject *object in objects)
+        resetDepth(object);
+    
+    // create the final sorted list
+    
+    orderedObjects = [NSMutableArray array];
+    if (increasing)
+        enumerator = [objectLevels objectEnumerator];
     else
-        enumerator = [classNames reverseObjectEnumerator];
+        enumerator = [objectLevels reverseObjectEnumerator];
     
-    for(NSString *className in enumerator) {
-        NSArray                         *observers;
-        Class                           subclass;
-        NSArray                         *objectArrays;
-        
-        subclass = self.registeredClasses[className];
-        observers = self.observers[className];
-        if (!observers)
-            continue;
-        
-        objectArrays = dictionary[@"instances"][className];
-
-        block(observers, subclass, objectArrays);
-    }
+    for(NSArray *objects in enumerator)
+        [orderedObjects addObjectsFromArray:objects];
+    
+    return orderedObjects;
 }
 
 
-// notifyRemoteChanges: invokes the notification handlers for all registered observers on the objects that have been flagged as remotely modified
+// notifyChanges: notify the notification handlers of object changes
                                                            
-- (void)notifyRemoteChanges
+- (void)notifyChanges
 {
-    NSDictionary        *orderedClassesDictionary;
+    NSMutableSet        *voidedObjects;
+    NSMutableSet        *confirmedObjects;
+    NSArray             *notifiedObjects;
+    NSMutableSet        *allObjects;
+    NSMutableSet        *notifiedObservers;
     
     // The first step is to save and reset the locally modified object lists and
     // object local change lists so that the notification handlers can safely alter object state (changes initiated by notification
     // handlers won't be synced until the next sync)
     
-    for(SLObject *object in
-                [self.locallyModifiedObjects setByAddingObjectsFromSet:self.remotelyModifiedObjects]) {
-        object.savedLocalChanges = object.localChanges;
-        object.localChanges = [NSMutableDictionary dictionary];
+    for(SLObject *object in [self.locallyModifiedObjects setByAddingObjectsFromSet:self.remotelyModifiedObjects]) {
+        [object saveLocalChanges];
     }
 
     self.savedLocallyModifiedObjects = self.locallyModifiedObjects;
@@ -1002,124 +1235,166 @@ static void uncolorize(SLObject *object)
     self.savedLocallyDeletedObjects = self.locallyDeletedObjects;
     self.savedLocallyDeletedObjectIDMap = self.locallyDeletedObjectIDMap;
     self.locallyModifiedObjects = [NSMutableSet set];
-    self.locallyModifiedObjectIDMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory valueOptions:NSMapTableWeakMemory];
+    self.locallyModifiedObjectIDMap = [NSMutableDictionary dictionary];
     self.locallyCreatedObjects = [NSMutableSet set];
     self.locallyDeletedObjects = [NSMutableSet set];
-    self.locallyDeletedObjectIDMap = [NSMapTable mapTableWithKeyOptions:NSMapTableStrongMemory valueOptions:NSMapTableWeakMemory];
+    self.locallyDeletedObjectIDMap = [NSMutableDictionary dictionary];
     
-    // Notifications are grouped by subclass, and sent to all class instances, one class at a time
-    // subclasses are ordered so that, for cycle-less object graphs:
-    // - the creation or modification of a child is notified before the creation or modification of its parent
-    // - the deletion of a child is notified after the deletion of its parent
-    // for each class, notifications are sent in that order: creations, modifications and deletions
+    // Notifications are grouped by type and are sent in that order:
+    // 1- remote object deletions
+    //      order: parent objects before their children (see below)
+    // 2- remote object creations
+    //      order: children objects before their parents (see below)
+    // 3- voided transaction object modifications
+    //      order: reverse chronological
+    // 3- confirmed transaction object modifications
+    //      order: chronological
+    // 4- remote object modifications
+    //      order: chronological
     
-    orderedClassesDictionary = [self orderClassesByAncestry:@[self.remotelyCreatedObjects, self.remotelyModifiedObjects, self.remotelyDeletedObjects]];
+    // Notifications of object creations and deletions are sent in the following order:
+    // - object creation: if a newly created object A has a relation attribute that points to another newly created
+    //      object B, the creation of B is notified before the creation of A. However the order of notification is
+    //      undetermined if B points back to A, directly or indirectly through other objects.
+    // - object deletion: if a deleted object A has a relation attribute that point to another deleted object B, the
+    //      deletion of A is notified before the deletion of B. However the order of notification is undetermined if
+    //      B points back to A, directly or indirectly through other objects.
+    //
+    // If 2 or more observers register to be notified of changes to the same subclass, they are notified in the same
+    // order they registered for the following notification types:
+    // - remote object creation
+    // - before remote object modification
+    // - before confirmed transaction object modification
+    // - after voided transaction object modification
+    // Observers are notifified in the opposite order they registered for the following notification types:
+    // - remote object deletion
+    // - after remote object modification
+    // - after confirmed transaction object modification
+    // - before voided transaction object modification
     
-    // notify the beginning of change notifications
+    // determine the list of all notified observers
+    // for this, we first build the list of all notified objects
     
-    [self performOnAllClasses:orderedClassesDictionary inOrder:TRUE block: ^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-        for(NSObject<SLObjectObserving> *observer in observers)
-            if ([observer respondsToSelector:@selector(willChangeObjectsForClass:)])
-                [observer willChangeObjectsForClass:subclass];
-    }];
+    voidedObjects = [NSMutableSet set];
+    assert(voidedObjects);
+    for(SLChange *change in self.voidedChanges)
+        [voidedObjects addObject:change.object];
+    
+    confirmedObjects = [NSMutableSet set];
+    assert(confirmedObjects);
+    for(SLChange *change in self.confirmedChanges)
+        [confirmedObjects addObject:change.object];
+    
+    allObjects = [self.remotelyDeletedObjects mutableCopy];
+    assert(allObjects);
+    [allObjects unionSet:self.remotelyCreatedObjects];
+    [allObjects unionSet:voidedObjects];
+    [allObjects unionSet:confirmedObjects];
+    [allObjects unionSet:self.remotelyModifiedObjects];
+    
+    // then we gather the registered observers for the notified objects
+    
+    notifiedObservers = [NSMutableSet set];
+    assert(notifiedObservers);
+    
+    for(SLObject *object in allObjects) {
+        NSArray         *observers;
+        
+        observers = self.observers[object.className];
+        [notifiedObservers addObjectsFromArray:observers];
+    }
+    
+    // notify the beginning of change notifications (observers notified in undetermined order)
+    
+    [self notifyObserversWillChangeObjects:[notifiedObservers allObjects]];
   
+    // notify object deletions
+    // - objects ordered by parent-child relationship, parents first
+    // - for each object, observers notified in reverse order of registration
+    
+    notifiedObjects = [self orderObjectsByAncestry:self.remotelyDeletedObjects increasing:FALSE];
+    for(SLObject *object in notifiedObjects)
+        [self notifyObserversWillDeleteObject:object remote:TRUE];
+
     // notify of object creations
+    // - objects ordered by parent-child relationship, children first
+    // - for each object, observers notified in order of registration
     
-    [self performOnAllClasses:orderedClassesDictionary inOrder:TRUE block: ^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-        for(SLObject *object in objectArrays[0]) {
-            for(NSObject<SLObjectObserving> *observer in observers) {
-                
-                // if the object has been deleted by an observer, no further notification to send
-                if (!object.operable)
-                    break;
-                
-                // keep track of the last observer notified of the object creation, so that reentrant
-                // object operations (e.g. setting an attribute within an object creation notification handler)
-                // do not reveal the object to observers that have not been notified of its creation yet
-                
-                object.lastObserverNotified = observer;
-                if ([observer respondsToSelector:@selector(didCreateObject:remotely:)])
-                    [observer didCreateObject:object remotely:TRUE];
-            }
-            object.lastObserverNotified = nil;
-        }
-    }];
+    notifiedObjects = [self orderObjectsByAncestry:self.remotelyCreatedObjects increasing:TRUE];
+    for(SLObject *object in notifiedObjects)
+        [self notifyObserversDidCreateObject:object remote:TRUE];
 
+    // notify of voided transaction object modifications
+    // - changes ordered in reverse chronological order, most recent first
+    // - for each object, observers notified in order of registration
+    
+    for(SLChange *change in self.voidedChanges) {
+        
+        assert([change.object dictionaryValueForKey:change.key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE] == change.nValue);
+
+        // notify before the change
+        
+        [self notifyObserversWillResetObjectValue:change.object forKey:change.key oldValue:change.nValue newValue:change.oValue];
+        
+        // update the value dictionary
+        
+        [change.object setDictionaryValue:change.oValue forKey:change.key speculative:FALSE change:nil];
+
+        // notify after the change
+        
+        [self notifyObserversDidResetObjectValue:change.object forKey:change.key oldValue:change.nValue newValue:change.oValue];
+    }
+    
+    // notify of confirmed transaction object modifications
+    // - changes ordered in  chronological order, oldest first
+    // - for each object, observers notified in order of registration
+
+    for(SLChange *change in self.confirmedChanges) {
+        
+        assert([change.object dictionaryValueForKey:change.key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE] == change.oValue);
+
+        // notify before the change
+        
+        [self notifyObserversWillChangeObjectValue:change.object forKey:change.key oldValue:change.oValue newValue:change.nValue remote:FALSE];
+        
+        // update the value dictionary
+        
+        [change.object setDictionaryValue:change.nValue forKey:change.key speculative:FALSE change:nil];
+        
+        // notify after the change
+        
+        [self notifyObserversDidChangeObjectValue:change.object forKey:change.key oldValue:change.oValue newValue:change.nValue remote:FALSE];
+    }
+    
     // notify of remote object modifications
-    
-    [self performOnAllClasses:orderedClassesDictionary inOrder:TRUE block: ^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-        for(SLObject *object in objectArrays[1])
-            
-            // iterate over a copy of the remote changes, as notification handlers may set properties and cancel remote changes
-            
-            for(NSString *key in [object.remoteChanges copy]) {
-                SLChange    *change;
-                
-                change = object.remoteChanges[key];
-                
-                // make sure the remote change is still current
-                
-                if (!change)
-                    continue;
-                
-                assert(!change.local);
-                
-                // notify prior to the value change (in reverse order of registration)
-                
-                for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
-                    
-                    // if the object has been deleted by an observer, no further notification to send
+    // - changes ordered in chronological order, oldest first
+    // - for each object, observers notified in order of registration
 
-                    if (!object.operable)
-                        break;
-                    
-                    if ([observer respondsToSelector:@selector(willChangeObjectValue:forKey:oldValue:newValue:remotely:)])
-                        [observer willChangeObjectValue:object forKey:key oldValue:change.oValue newValue:change.nValue remotely:TRUE];
-                }
-                
-                // update the value dictionary
-                
-                [object setDictionaryValue:change.nValue forKey:key];
-                
-                // notify after the value change
-                
-                for(NSObject<SLObjectObserving> *observer in observers) {
-                    
-                    // if the object has been deleted by an observer, no further notification to send
-                    
-                    if (!object.operable)
-                        break;
+    for(SLChange *change in [self.remoteChanges copy]) {
+        
+        // make sure the remote change is still current (hasn't been canceled by a notification handler)
 
-                    if ([observer respondsToSelector:@selector(didChangeObjectValue:forKey:oldValue:newValue:remotely:)])
-                        [observer didChangeObjectValue:object forKey:key oldValue:change.oValue newValue:change.nValue remotely:TRUE];
-                }
-            }
-    }];
+        if (![self.remoteChanges containsObject:change])
+            continue;
+        
+        assert([change.object dictionaryValueForKey:change.key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE] == change.oValue);
+        
+        // notify before the change
+        
+        [self notifyObserversWillChangeObjectValue:change.object forKey:change.key oldValue:change.oValue newValue:change.nValue remote:TRUE];
+        
+        // update the value dictionary
+        
+        [change.object setDictionaryValue:change.nValue forKey:change.key speculative:FALSE change:nil];
 
-    // notify object deletions (in reverse order of registration)
+        // notify after the change
+        
+        [self notifyObserversDidChangeObjectValue:change.object forKey:change.key oldValue:change.oValue newValue:change.nValue remote:TRUE];
+    }
 
-    [self performOnAllClasses:orderedClassesDictionary inOrder:FALSE block: ^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-        for(SLObject *object in objectArrays[2])
-            for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator]) {
-                
-                // if the object has been deleted by an observer, no further notification to send
-                
-                if (!object.operable)
-                    break;
-                
-                if ([observer respondsToSelector:@selector(willDeleteObject:remotely:)])
-                    [observer willDeleteObject:object remotely:TRUE];
-            }
-    }];
+    // notify the end of change notifications (observers notified in undetermined order)
     
-    // notify the end of change notifications (in reverse order of registration)
-    
-    [self performOnAllClasses:orderedClassesDictionary inOrder:FALSE block: ^(NSArray *observers, Class subclass, NSArray *objectArrays) {
-        for(NSObject<SLObjectObserving> *observer in [observers reverseObjectEnumerator])
-            if ([observer respondsToSelector:@selector(didChangeObjectsForClass:)])
-                [observer didChangeObjectsForClass:subclass];
-    }];
-    
+    [self notifyObserversDidChangeObjects:[notifiedObservers allObjects]];
 }
 
 
@@ -1140,13 +1415,30 @@ static void uncolorize(SLObject *object)
         if (!object || object.deleted)
             continue;
         
-        // the object is locally registered and not being locally deleted
-        // it is being remotely deleted if the database object is marked for deletion
+        // the object is in the registry and it is not being locally deleted
+        // check if the database object has the delete attribute set
         
-        if ([dbObject objectForKey:kPFObjectDeleteFlagKey])
+        if ([dbObject objectForKey:kPFObjectDeleteFlagKey]) {
+            
+            // the delete attribute is set. the object is being remotely deleted
+            
+            // add the object to the list of remotely deleted objects so that it can
+            // be deleted and notified later
+            
             [self.remotelyDeletedObjects addObject:object];
+            
+            // initiate the object deletion cycle
+            
+            [object startDeletion];
+            
+            // handle the transactions for the remotely deleted object.
+            // this has to be done here rather than later because we need
+            // all transactions either voided or confirmed before we
+            // start notifications
+            
+            [object handleTransactionsForDeletedObject:FALSE];
+        }
     }
-
 }
 
 
@@ -1209,7 +1501,7 @@ static void uncolorize(SLObject *object)
 }
 
 
-// identifyRemotelyModifiedObjects creates a lits of objects whose attributes have been modified remotely
+// identifyRemotelyModifiedObjects creates a list of objects whose attributes have been modified remotely
 
 - (void)identifyRemotelyModifiedObjects
 {
@@ -1243,16 +1535,16 @@ static void uncolorize(SLObject *object)
         
         for (NSString *key in [dbObject allKeys]) {
             
-            id          remoteValue;
-            id          localValue;
-            SLChange    *change;
-            NSDate      *dbObjectModifiedTime;
-            BOOL        equal;
+            id              remoteValue;
+            id              localValue;
+            SLChange        *change;
+            NSDate          *dbObjectModifiedTime;
+            BOOL            equal;
             
             if ([kPFObjectSystemKeys containsObject:key])
                 continue;
-            
-            localValue = [object dictionaryValueForKey:key];
+
+            localValue = [object dictionaryValueForKey:key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE];
             remoteValue = [object databaseToDictionaryValue:[dbObject objectForKey:key]];
             
             // compare the values
@@ -1274,7 +1566,8 @@ static void uncolorize(SLObject *object)
                 // no local change is found for this key, log the remote change.
                 
                 if (!change) {
-                    [SLChange changeWithObject:object local:FALSE key:key oldValue:localValue newValue:remoteValue when:[NSDate date]];
+                    [SLChange remoteChangeWithObject:object key:key oldValue:localValue newValue:remoteValue timeStamp:dbObjectModifiedTime];
+                    [object voidTransactionsCapturingKey:key];
                     continue;
                 }
                 
@@ -1284,14 +1577,14 @@ static void uncolorize(SLObject *object)
                 
                 // keep the most recent change
                 
-                if ([change.when laterDate:dbObjectModifiedTime] == dbObjectModifiedTime) {
+                if ([change compareTimeStampToDate:dbObjectModifiedTime] == NSOrderedAscending) {
                     
                     // the remote change is more recent. forego the local change and log the remote change
                     // the change object is modified in place to reflect the change.
                     
-                    [change detachFromObject];
-                    [SLChange changeWithObject:object local:FALSE key:key oldValue:localValue newValue:remoteValue when:[NSDate date]];
-
+                    [change detach];
+                    [SLChange remoteChangeWithObject:object key:key oldValue:localValue newValue:remoteValue timeStamp:dbObjectModifiedTime];
+                    [object voidTransactionsCapturingKey:key];
                     continue;
                 }
                 
@@ -1302,6 +1595,45 @@ static void uncolorize(SLObject *object)
     }
 }
 
+// finalizeUncommittedChanges determines which uncommitted changes to void and which to confirm
+
+- (void)finalizeUncommittedChanges
+{
+    self.voidedChanges = [self.transactionMgr voidedChanges];
+    self.confirmedChanges = [self.transactionMgr confirmedChanges];
+    
+    // merge remote changes with confirmed transactional changes to ensure proper ordering
+    // if a remote change conflicts with a transactional change, we check the change timestamp
+    // if the remote change happened after the transactional change, we keep both changes and
+    // update the old value of the remote change (the remote change will be notified after the transactional change)
+    // if the remote change happened before the transactional change, we drop the remote change
+    
+    for(SLChange *change in self.confirmedChanges) {
+        
+        SLObject        *object;
+        NSString        *key;
+        SLChange        *remoteChange;
+        
+        object = change.object;
+        if (![self.remotelyModifiedObjects containsObject:object])
+            continue;
+        
+        key = change.key;
+        remoteChange = object.remoteChanges[key];
+        if (!remoteChange)
+            continue;
+        
+        if ([remoteChange compareTimeStamp:change] == NSOrderedDescending) {
+            remoteChange.oValue = change.nValue;
+        } else {
+            [remoteChange detach];
+        }
+    }
+
+    // all the uncommitted values that we need to keep have been committed. we can now clear the uncommitted values
+    
+    [self clearUncommittedValues];
+}
 
 // resolveDanglingReferencesToDeletedObjects:local: takes a list of objects that have been deleted locally or remotely
 // and ensures that all references to those objects are set to nil. Any reference set to nil is properly logged and notified as needed.
@@ -1310,20 +1642,37 @@ static void uncolorize(SLObject *object)
 {
     for(SLObject *deletedObject in deletedObjects) {
         
-        // look for dangling references in local object values (object values before remote modifications are applied)
+        NSDate      *timeDeleted;
+
+        timeDeleted = nil;
+
+        // if this is a remotely deleted object, look for dangling references in local object values
+        // (object values before remote modifications are applied)
         // this isn't needed for local object deletions, as dangling references have already been set to nil when the object was deleted.
-        // iterate over a copy of the reference list as it is modified by the loop body
         
         if (!local)
-            for(SLObject *object in [deletedObject.references copy]) {
+            for(SLObject *referencingObject in deletedObject.referencingObjects) {
+
+                // determine the time the object was deleted if this hasn't already been done
                 
-                // look for the relations pointing back to the deleted object
-                // for each dangling reference, log a change to set the reference to nil
-                // iterate over a copy of the value dictionary as it is being modified by the loop body
+                if (!timeDeleted) {
+                    PFObject    *dbObject;
+                    
+                    dbObject = [self.downloadedObjectIDMap objectForKey:deletedObject.objectID];
+                    assert(dbObject);
+                    timeDeleted = [dbObject objectForKey:kPFObjectLastModifiedKey];
+                    assert(timeDeleted);
+                }
                 
-                for(NSString *key in [object.values copy]) {
-                    if ([object dictionaryValueForKey:key] == deletedObject)
-                        [SLChange changeWithObject:object local:FALSE key:key oldValue:deletedObject newValue:nil when:[NSDate date]];
+                for(NSString *key in [deletedObject referencingKeysForObject:referencingObject]) {
+                    
+                    // we log a remote change for the dangling reference
+                    // if the dangling reference has already been remotely fixed, there's already a remote change for this and
+                    //      no new change will be created
+                    // if the dangling reference is the result of a local change, the local change will be dropped when the remote
+                    //      change is logged
+                    
+                    [SLChange remoteChangeWithObject:referencingObject key:key oldValue:deletedObject newValue:nil timeStamp:timeDeleted];
                 }
             }
         
@@ -1348,15 +1697,12 @@ static void uncolorize(SLObject *object)
                 change = object.remoteChanges[key];
                 assert(!change.local);
                 
-                // if the new value of the remote change points to the deleted object, fix the dangling reference:
-                // if the  value prior to the remote change was nil, we can drop the remote change (no change needs to be applied_
-                // otherwise, we change the new value to be nil
+                // if the value of the remote change points to the deleted object, we fix the dangling reference by setting it to nil
+                // and updating the timestamp.
                 
                 if (change.nValue == deletedObject) {
-                    if (!change.oValue)
-                        [change detachFromObject];
-                    else
-                        change.nValue = nil;
+                    change.nValue = nil;
+                    [change updateTimeStamp];
                 }
             }
         }
@@ -1409,12 +1755,24 @@ static void uncolorize(SLObject *object)
 
 - (void)mergeChanges
 {
+    [self.transactionMgr runPendingTransactions];
+    
     [self identifyRemotelyDeletedObjects];
     [self identifyRemotelyCreatedObjects];
     [self identifyRemotelyModifiedObjects];
-        
+    
+    [self finalizeUncommittedChanges];
+    
     [self resolveDanglingReferences];
     [self updateDatabaseObjectCache];
+    
+    // now that all remote changes have been identified, they can be sorted by timestamp
+    
+    // sort the changes in chronological order
+    
+    [self.remoteChanges sortUsingComparator: ^ NSComparisonResult (SLChange *changeA, SLChange *changeB) {
+        return [changeA compareTimeStamp:changeB];
+    }];
 }
 
 
@@ -1653,15 +2011,15 @@ static void uncolorize(SLObject *object)
         // populate the database dictionary
         
         cloudPersistedProperties = self.cloudPersistedProperties[object.className];
-        
-        for(NSString *key in object.values) {
+
+        for(NSString *key in object.dictionaryKeys) {
             id      value;
             
             // capture only the cloud persisted properties
             
             if (![cloudPersistedProperties containsObject:key])
                 continue;
-            value = [object dictionaryToDatabaseValue:[object dictionaryValueForKey:key]];
+            value = [object dictionaryToDatabaseValue:[object dictionaryValueForKey:key useSpeculative:FALSE wasSpeculative:NULL capture:FALSE]];
             [object.databaseObject setObject:value forKey:key];
         }
     }

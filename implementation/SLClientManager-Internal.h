@@ -1,22 +1,18 @@
 //
-//  SLSyncManager.h
+//  SLSyncManager-Internal.h
 //
 //  Copyright (c) 2014 Cyril Meurillon. All rights reserved.
 //
 
 #import <Foundation/Foundation.h>
+#import "SLClientManager.h"
 
 
-@interface SLClientManager : NSObject
-
-@property (readonly) BOOL                   syncing;
+@interface SLClientManager ()
 
 + (SLClientManager *)sharedClientManager;
 
 - (void)registerSyncClient:(NSString *)clientKey appID:(NSString *)appID;
-
-- (void)unarchiveFromDictionary:(NSDictionary *)dictionary;
-- (NSDictionary *)archiveToDictionary;
 
 - (void)enablePush:(NSData *)deviceToken;
 - (void)handlePushNotification: (NSDictionary *)userInfo;
@@ -29,5 +25,9 @@
 
 - (void)fetchClassListInBackgroundWithBlock:(void(^)(NSError *, NSArray *))completion;
 - (void)saveClassListInBackgroundWithBlock:(void(^)(NSError *))completion;
+
+// getter for read-only property
+
+- (BOOL)syncing;
 
 @end

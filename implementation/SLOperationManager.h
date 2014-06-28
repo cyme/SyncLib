@@ -7,8 +7,9 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "Parse/Parse.h"
-#import "BlockCondition.h"
+
+@class PFObject;
+@class PFQuery;
 
 // SLOperationManager is a singleton class that provides
 // 1) serialization for SyncLib operations and
